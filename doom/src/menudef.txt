@@ -1,0 +1,33 @@
+// IsaacDoom menus
+ListMenu "MainMenu"
+{
+	Class "IsaacMainMenu"
+	Font "ISUPHEAV", "Untranslated"
+	Selector "IUHRF", -22, -3
+	Linespacing 24
+	Position 130, 70
+	TextItem "Continue", "c", "-"
+	TextItem "New Run", "n", "IsaacCharMenu"
+	TextItem "Challenge", "h", "IsaacChallengeMenu"
+	TextItem "Seed", "e", "-"
+	TextItem "Save File", "s", "-"
+	TextItem "Resume", "r", "-"
+	TextItem "Options", "o", "OptionsMenu"
+	TextItem "Quit", "q", "QuitMenu"
+}
+
+ListMenu "IsaacCharMenu"
+{
+	Class "IsaacCharMenu"
+	Font "ISUPHEAV", "Untranslated"
+	Position 0, 0
+	StaticText 0, 0, " "
+}
+
+ListMenu "IsaacChallengeMenu"
+{
+	Class "IsaacChallengeMenu"
+	Font "ISUPHEAV", "Untranslated"
+	Position 0, 0
+	StaticText 0, 0, " "
+}

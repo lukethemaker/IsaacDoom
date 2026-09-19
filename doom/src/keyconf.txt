@@ -1,0 +1,4 @@
+// Defined by the engine at startup, so the alias exists before any cfg runs.
+alias isaac_loop "exec isaac_in.cfg; wait 1; isaac_loop"
+// The bridge presses Scroll Lock once if Doom stays silent, to start the loop.
+defaultbind scroll "isaac_loop"

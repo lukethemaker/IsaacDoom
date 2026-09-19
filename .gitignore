@@ -1,0 +1,20 @@
+# game-derived and per-machine: never commit
+pipe/
+build/
+sprites/
+engine/
+dist/
+doom/rocks/
+doom/*.pk3
+settings.ini
+settings.bat
+tools/sprite_report.txt
+tools/overlay_log.csv
+tools/flow/
+__pycache__/
+*.pyc
+*.tmp
+*.log
+# your own music stays yours
+altmusic/*
+!altmusic/README.txt

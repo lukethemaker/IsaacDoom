@@ -1,0 +1,14 @@
+GameInfo
+{
+	AddEventHandlers = "IsaacHandler"
+}
+
+map MAP01 "Isaac Arena"
+{
+	levelnum = 1
+	sky1 = "SKY1"
+	music = ""
+	next = "MAP01"
+	nointermission
+	noautosequences
+}

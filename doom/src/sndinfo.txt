@@ -1,0 +1,12 @@
+// IsaacDoom: Doomguy keeps quiet - Isaac makes the noises
+$playersound player male *grunt   dsempty
+$playersound player male *land    dsempty
+$playersound player male *usefail dsempty
+$playersound player male *jump    dsempty
+$playersound player male *fist    dsempty
+$playersound player male *pain100 dsempty
+$playersound player male *pain75  dsempty
+$playersound player male *pain50  dsempty
+$playersound player male *pain25  dsempty
+$playersound player male *death   dsempty
+$playersound player male *xdeath  dsempty

@@ -1,0 +1,8 @@
+<metadata>
+	<name>IsaacDoom Bridge</name>
+	<directory>isaacdoom</directory>
+	<id></id>
+	<description>Streams the current room, enemies, projectiles and player state to a file so GZDoom can mirror it, and accepts movement/fire/door commands from the Doom side.</description>
+	<version>0.1</version>
+	<visibility>Private</visibility>
+</metadata>

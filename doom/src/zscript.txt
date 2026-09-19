@@ -1,0 +1,3974 @@
+version "4.10"
+
+// ---------------------------------------------------------------------------
+// IsaacDoom - GZDoom side of the bridge.
+//
+// Inbound (bridge -> Doom): the bridge writes isaac_in.cfg which does
+//     set isaac_room   "W,H,bstate,label,backdrop"
+//     set isaac_grid   "<W*H cell chars, row-major>"
+//     set isaac_ents   "id:kind:type:variant:x:y:vx:vy:size:boss:sub:name:anm2:anim:frame:flip:hp:maxhp:ovanim:ovframe|..."
+//     set isaac_player "hearts,maxhearts,soul,bombs,keys,coins,tx,ty,teleport"
+//     set isaac_hud    "activeName|charge|maxcharge|pocketName"
+//     set isaac_fx     "boom:x:y|..."      (+ isaac_fxseq bumps when new)
+//     set isaac_seq    <n>
+// Everything is in Doom units already (bridge does the conversion).
+//
+// Outbound (Doom -> bridge): one log line per tic when something changed:
+//     IS <tic> <x> <y> <angle> <fire> <bomb> <seqAck> <use> <card>
+// ---------------------------------------------------------------------------
+
+class IsaacHandler : EventHandler
+{
+	const M = 3;                // margin cells around the room (door passages)
+	const GW = 28 + 2 * M;
+	const GH = 16 + 2 * M;
+	const CS = 64;
+	const PASSAGE_DEPTH = 3;
+	const PASSAGE_LIGHT = 40;
+	const DOOR_CEIL = 96;       // doorway and passage ceiling: lower than the room so the door art caps it
+	const PIT_DEPTH = 64;       // real pits: you fall in and can't climb out
+	const PIT_LIGHT = 120;      // light inside a pit: the floor flat is black anyway, this lights the sides
+	Array<Actor> rockActors;    // per map cell: low-poly rock model standing on a plain rock cell
+	const BACKDROP_CRAWLSPACE = 29;
+	const ROOM_LIGHT = 176;
+	const CEIL = 128;
+	const BOSS_CEIL = 192;      // boss rooms are taller so the big bosses stand at full size
+	int roomType;               // Isaac RoomType of the current room (5 = boss)
+	clearscope int roomCeil() { return roomType == 5 ? BOSS_CEIL : CEIL; }
+	const DOOR_SPEED = 16;      // classic door speed
+	const INSTANT = 2048;
+
+	Array<Sector> cells;
+	Array<Actor> gridActors;
+	Array<IsaacGridSprite> gridSprites;   // one per cell, Isaac art for grid entities
+	String curGrid;
+	int curW, curH;
+	int lastSeq, lastFxSeq, lastSfxSeq;
+	bool haveIsaacSfx;     // isaacsfx.pk3 loaded: Isaac's own sounds replace the Doom stand-ins
+	int lastMusic;         // Isaac track id currently playing through Doom
+	bool lastFast;         // ...and whether the sped-up (unicorn) variant is playing
+	bool unicorn;          // unicorn invincibility active
+	Dictionary musicFast;  // id -> "1" when a fast variant (IS<id>F) exists
+	Dictionary musicAlt;   // id -> "1" when a track of your own (IA<id>, from altmusic\) replaces the game's
+	bool haveIsaacMusic;
+	Dictionary musicLoop;  // id -> "1"/"0" from ISMUSIC
+	int bstate;            // 0 = play, 1 = loading
+	bool instantNext;      // next grid apply is a room load: no door animations
+	String label;
+	int loadingSince;
+	Array<IsaacMirror> mirrors;
+	int fireTics, bombTics, useTics, cardTics, restartTics;
+	int newRunId, newRunTics;    // "new run as character" request from the menu
+	int newRunSlot;              // ...on this Isaac save file (1-3)
+	bool dropHeld;               // Isaac's drop button (Ctrl) held
+	int lastTintPrint;
+	String seedOut;              // seed to announce with the next new-run line
+	int hearts, maxHearts, soul, bombs, keys, coins;
+	String activeName, pocketName;
+	int activeCharge, activeMax;
+	int activeId, trinketId, heldId;
+	String heldKind, heartsStr;
+	bool curseDark;          // Curse of Darkness: rooms go black, Isaac carries a small light
+	int stageNum, stageType, playerType;
+	Actor controlsDecal;   // MOVE/ATTACK/BOMB/ITEM art on the first room's floor
+	// stage transition: nightmare (dream bubble) then the progress card
+	// floor transition, in step with Isaac: the dream plays from the fall until the new
+	// floor's state arrives (isaac_stageseq bumps), then the progress card shows over the room
+	// fading in from black for as long as Isaac stands frozen on its own card (isaac_frozen)
+	int transStart, transCardAt, transNightmare;
+	int cardEndAt;         // maptime Isaac left its card (card fades out from here), 0 while it shows
+	int lastStageSeq;
+	bool frozenNow;
+	int lastFallSeq;
+	bool fallSeen;
+	ui Dictionary nmData;    // "n" -> "count x y step" per nightmare
+	// boss VS screen
+	int introSeq, introStart, introBoss, introBoss2, introPlayer;
+	bool introSeen;              // an intro sequence number has been read since this handler started
+	String introSpot;
+	ui Dictionary bossPivots;   // "id" -> "px py"
+	String padding;
+	String lastOut;
+	int lastOutTic;
+	ui int uiLastMapTime, uiStalled;
+	ui bool uiPaused;
+	bool gotFirstFrame;
+	TextureID doorTex;
+	int backdropId, appliedBackdrop;
+	bool playerFlying;
+	String popupName, popupDesc, popupKind;
+	int popupUntil, lastPopupSeq;
+	TextureID floorTex, wallTex, ceilTex;
+	int overlayId;         // Isaac's shadow overlay for this room (1..5, 0 none): picks a baked floor flat
+	// minimap: one entry per known room
+	Array<int> mapGi, mapShape, mapType, mapFlags, mapVisited;
+	int mapCurrent;
+	bool mapBig;
+	double bossMax;        // combined max HP of the bosses in the room (locked when they appear)
+	double bossHp, bossShown;
+	int bossTics;          // tics since a boss was last seen
+	Dictionary sprTable;      // "anm2key|Anim" -> frame tokens, from isaacsprites.pk3
+	bool sprTableLoaded;
+	bool sprWarned;
+	int sprTableSize;
+
+	// isaacsprites.pk3 (built by tools/build_sprites.py) ships an ISAACSPR.txt lump
+	void loadSpriteTable()
+	{
+		sprTableLoaded = true;
+		haveIsaacSfx = Wads.CheckNumForFullName("sounds/is/1_0.wav") >= 0 || Wads.CheckNumForFullName("sounds/is/12_0.wav") >= 0;
+		sprTable = Dictionary.Create();
+		int lump = Wads.CheckNumForFullName("ISAACSPR.txt");
+		if (lump < 0) { Console.Printf("IsaacDoom: no isaacsprites.pk3 loaded, using Doom stand-ins"); return; }
+		String data = Wads.ReadLump(lump);
+		Array<String> lines;
+		data.Split(lines, "\n", TOK_SKIPEMPTY);
+		for (int i = 0; i < lines.Size(); i++)
+		{
+			int p1 = lines[i].IndexOf("|");
+			if (p1 < 0) continue;
+			int p2 = lines[i].IndexOf("|", p1 + 1);
+			if (p2 < 0) continue;
+			sprTable.Insert(lines[i].Left(p2), lines[i].Mid(p2 + 1));
+			sprTableSize++;
+		}
+		Console.Printf("IsaacDoom: %d Isaac animations available", sprTableSize);
+	}
+
+	override void OnRegister()
+	{
+		SetOrder(1000);
+	}
+
+	// ---- setup ------------------------------------------------------------
+
+	override void WorldLoaded(WorldEvent e)
+	{
+		Console.Printf("IsaacDoom: handler loaded, building arena");
+		if (!sprTableLoaded) loadSpriteTable();
+		cells.Clear();
+		for (int r = 0; r < GH; r++)
+			for (int c = 0; c < GW; c++)
+				cells.Push(Level.PointInSector((c * CS + CS / 2, -(r * CS + CS / 2))));
+		curGrid = "";
+		curW = 15; curH = 9;
+		bstate = 1;
+		instantNext = true;
+		label = "Waiting for Isaac...";
+		loadingSince = level.maptime;
+		lastSeq = -1;
+		lastFxSeq = 0;
+		gotFirstFrame = false;
+		doorTex = TexMan.CheckForTexture("BIGDOOR2", TexMan.Type_Wall);
+		padding = "";
+		int pad = CVar.FindCVar('isaac_logpad').GetInt();
+		for (int i = 0; i < pad; i++) padding.AppendCharacter(32);
+		Console.Printf("IsaacDoom: arena ready, waiting for bridge");
+	}
+
+	override void PlayerEntered(PlayerEvent e)
+	{
+		let pmo = players[e.PlayerNumber].mo;
+		if (!pmo) return;
+		pmo.ClearInventory();
+		pmo.GiveInventory("IsaacTearGun", 1);
+		pmo.A_SelectWeapon("IsaacTearGun");
+		pmo.health = 100;
+		players[e.PlayerNumber].health = 100;
+		setFrozen(true);
+	}
+
+	void setFrozen(bool f)
+	{
+		if (f) players[consoleplayer].cheats |= CF_TOTALLYFROZEN;
+		else players[consoleplayer].cheats &= ~CF_TOTALLYFROZEN;
+	}
+
+	// ---- grid -------------------------------------------------------------
+
+	// cell character -> floor height, flat, blocking actor class, door state
+	// doorState: 0 = not a door, 1 = open door, 2 = closed door
+	void cellParams(int ch, out double h, out String flat, out String cls, out int doorState, int idx = -1)
+	{
+		h = 0; flat = "FLOOR0_3"; cls = ""; doorState = 0;
+		switch (ch)
+		{
+			case 87: // 'W' wall
+			case 120: // 'x' outside room
+				h = backdropId == BACKDROP_CRAWLSPACE ? DOOR_CEIL : roomCeil(); break;
+			case 100: // 'd' closed door: solid wall behind the Isaac door sprite
+				h = roomCeil(); break;
+			case 68: // 'D' open door: an opening into the passage
+				flat = "FLAT5_4"; break;
+			case 82: // 'R' rock -> barrel
+				cls = "IsaacRockBarrel"; break;
+			case 80: // 'P' poop / low object -> small barrel
+				cls = "IsaacPoopBarrel"; break;
+			case 112: // 'p' pit: a black drop you can't step over (walkable when Isaac can fly)
+				// no blocking actor: the player's centre is kept out of the cell each tic instead
+				// (WorldTick), the way Isaac tests it, so pit edges slide and diagonal gaps pass
+				h = playerFlying ? 0 : -PIT_DEPTH; flat = playerFlying ? "FLOOR0_3" : "ISCEIL";
+				break;
+			case 115: // 's' spikes
+				flat = "BLOOD1"; break;
+			case 84: // 'T' open trapdoor: a deep shaft down to the next floor
+				h = -400; flat = "FLAT19"; break;
+			case 116: // 't' closed trapdoor
+				flat = "FLAT19"; break;
+			case 83: // 'S' crawlspace ladder
+				h = -8; flat = "FLAT19"; break;
+			default: break;
+		}
+	}
+
+	void setDoorTextures(Sector s)
+	{
+		if (!doorTex.IsValid()) return;
+		for (int i = 0; i < s.lines.Size(); i++)
+		{
+			Line l = s.lines[i];
+			for (int k = 0; k < 2; k++)
+			{
+				Side sd = l.sidedef[k];
+				if (sd && sd.sector != s) sd.SetTexture(Side.top, doorTex);
+			}
+		}
+	}
+
+	// Isaac's floor / wall art for the current backdrop, from isaacsprites.pk3 (ISFnn / ISWnn)
+	void applyBackdrop()
+	{
+		appliedBackdrop = backdropId;
+		floorTex = TexMan.CheckForTexture(String.Format("ISF%02d", backdropId), TexMan.Type_Flat);
+		if (!floorTex.IsValid()) floorTex = TexMan.CheckForTexture("ISF01", TexMan.Type_Flat);
+		wallTex = TexMan.CheckForTexture(String.Format("ISW%02d", backdropId), TexMan.Type_Wall);
+		if (!wallTex.IsValid()) wallTex = TexMan.CheckForTexture("ISW01", TexMan.Type_Wall);
+		// a per-backdrop ceiling (the basement's wooden planks) when the sprite build made one, else black
+		ceilTex = TexMan.CheckForTexture(String.Format("ISC%02d", backdropId), TexMan.Type_Flat);
+		if (!ceilTex.IsValid()) ceilTex = TexMan.CheckForTexture("ISCEIL", TexMan.Type_Flat);
+		if (wallTex.IsValid())
+		{
+			// every cell edge is its own line, so give each side an x offset equal to its
+			// position along the wall: the texture then runs continuously across the cells
+			// instead of restarting (and overlapping) at every 64-unit line
+			Vector2 tsz = TexMan.GetScaledSize(wallTex);
+			double tw = tsz.x > 0 ? tsz.x : 64;
+			for (int i = 0; i < Level.Lines.Size(); i++)
+			{
+				Line l = Level.Lines[i];
+				Vector2 d = l.delta;
+				double len = d.Length();
+				Vector2 u = len > 0 ? d / len : (1, 0);
+				for (int k = 0; k < 2; k++)
+				{
+					Side sd = l.sidedef[k];
+					if (!sd) continue;
+					sd.SetTexture(Side.top, wallTex);
+					sd.SetTexture(Side.bottom, wallTex);
+					if (!l.sidedef[1]) sd.SetTexture(Side.mid, wallTex);
+					// front side draws from v1 towards v2, the back side from v2 towards v1
+					double t = k == 0 ? (l.v1.p dot u) : -((l.v2.p) dot u);
+					double off = t - floor(t / tw) * tw;
+					sd.SetTextureXOffset(Side.top, off);
+					sd.SetTextureXOffset(Side.bottom, off);
+					sd.SetTextureXOffset(Side.mid, off);
+				}
+			}
+		}
+		if (ceilTex.IsValid())
+			for (int i = 0; i < cells.Size(); i++)
+				if (cells[i]) cells[i].SetTexture(Sector.ceiling, ceilTex);
+		curGrid = "";   // force the floor flats to be reapplied
+	}
+
+	// ---- the room's shadow overlay as light: sprites standing in a shadow band darken -------
+	// build_sprites.py writes ISSHADE.txt: one line per baked overlay, "<backdrop> <shape> <n>
+	// <cols> <rows> <hex>", the overlay's brightness sampled SHADE_PER_CELL times per cell
+	// (00 = darkest, ff = lit). Each Isaac actor's LightLevel is set from the sample under it.
+	Array<int> shadeMap;
+	int shadeCols, shadeRows;
+	String shadeKey;
+	Dictionary shadeLines;
+	const SHADE_PER_CELL = 4;
+
+	void loadShadeMap(String key)
+	{
+		if (key == shadeKey) return;
+		shadeKey = key;
+		shadeMap.Clear(); shadeCols = 0; shadeRows = 0;
+		if (key.Length() == 0) return;
+		if (!shadeLines)
+		{
+			shadeLines = Dictionary.Create();
+			int lump = Wads.CheckNumForFullName("ISSHADE.txt");
+			if (lump >= 0)
+			{
+				Array<String> lines; Wads.ReadLump(lump).Split(lines, "\n", TOK_SKIPEMPTY);
+				for (int i = 0; i < lines.Size(); i++)
+				{
+					Array<String> f; lines[i].Split(f, " ", TOK_SKIPEMPTY);
+					if (f.Size() < 6) continue;
+					shadeLines.Insert(f[0] .. " " .. f[1] .. " " .. f[2], f[3] .. " " .. f[4] .. " " .. f[5]);
+				}
+			}
+		}
+		String v = shadeLines.At(key);
+		if (v.Length() == 0) return;
+		Array<String> f; v.Split(f, " ", TOK_SKIPEMPTY);
+		if (f.Size() < 3) return;
+		int cols = f[0].ToInt(), rows = f[1].ToInt();
+		String hex = f[2];
+		if (cols <= 0 || rows <= 0 || hex.Length() < cols * rows * 2) return;
+		shadeMap.Resize(cols * rows);
+		for (int i = 0; i < cols * rows; i++)
+			shadeMap[i] = hexDigit(hex.ByteAt(i * 2)) * 16 + hexDigit(hex.ByteAt(i * 2 + 1));
+		shadeCols = cols; shadeRows = rows;
+	}
+
+	static int hexDigit(int ch)
+	{
+		if (ch >= 48 && ch <= 57) return ch - 48;
+		if (ch >= 97 && ch <= 102) return ch - 87;
+		if (ch >= 65 && ch <= 70) return ch - 55;
+		return 15;
+	}
+
+	// overlay brightness (0..255) at a world position, bilinear between the samples
+	int shadeAt(double x, double y)
+	{
+		if (shadeCols == 0) return 255;
+		double step = CS / double(SHADE_PER_CELL);
+		double fx = (x - M * CS) / step - 0.5, fy = (-y - M * CS) / step - 0.5;
+		int x0 = int(floor(fx)), y0 = int(floor(fy));
+		double tx = fx - x0, ty = fy - y0;
+		int xa = clamp(x0, 0, shadeCols - 1), xb = clamp(x0 + 1, 0, shadeCols - 1);
+		int ya = clamp(y0, 0, shadeRows - 1), yb = clamp(y0 + 1, 0, shadeRows - 1);
+		double top = shadeMap[ya * shadeCols + xa] * (1 - tx) + shadeMap[ya * shadeCols + xb] * tx;
+		double bot = shadeMap[yb * shadeCols + xa] * (1 - tx) + shadeMap[yb * shadeCols + xb] * tx;
+		return int(top * (1 - ty) + bot * ty);
+	}
+
+	// light an Isaac actor by the shadow under it (its sector's light, scaled); -1 restores the sector light
+	void shadeActor(Actor a)
+	{
+		if (!a) return;
+		if (shadeCols == 0) { if (a.LightLevel != -1) a.LightLevel = -1; return; }
+		int base = a.CurSector ? a.CurSector.lightlevel : ROOM_LIGHT;
+		// only part of the floor's darkening: Doom's light levels fall off faster than a
+		// multiply, and a sprite in full shadow should still read (isaac_shadow tunes it)
+		double k = CVar.GetCVar('isaac_shadow', players[consoleplayer]).GetFloat();
+		double dark = (255 - shadeAt(a.pos.x, a.pos.y)) / 255.0 * clamp(k, 0.0, 1.0);
+		int lv = int(base * (1.0 - dark));
+		if (a.LightLevel != lv) a.LightLevel = lv;
+	}
+
+	// room cell (c, r) -> map cell index
+	int cellIndex(int c, int r) { return (r + M) * GW + (c + M); }
+
+	static bool isFloorChar(int ch)
+	{
+		return ch != 87 && ch != 120 && ch != 68 && ch != 100;   // not wall / outside / door
+	}
+
+	// character of a room cell, 'x' outside the room / grid
+	clearscope int gridChar(String g, int w, int h, int c, int r)
+	{
+		if (c < 0 || r < 0 || c >= w || r >= h || r * w + c >= int(g.Length())) return 120;
+		return g.ByteAt(r * w + c);
+	}
+
+	void applyGrid(String g, int w, int h)
+	{
+		curW = w; curH = h;
+		if (gridActors.Size() != GW * GH) { gridActors.Clear(); gridActors.Resize(GW * GH); }
+
+		// the room's shadow overlay, baked into a room-sized floor flat: ISO<backdrop><shape><n>
+		// (shape 0 = 1x1, 1 = 2x1, 2 = 1x2, 3 = 2x2 - the bake spans exactly that grid)
+		TextureID shadowTex; shadowTex.SetInvalid();
+		String shadeWant = "";
+		if (overlayId > 0 && (w == 15 || w == 28) && (h == 9 || h == 16))
+		{
+			int shape = (w == 28 ? 1 : 0) + (h == 16 ? 2 : 0);
+			shadowTex = TexMan.CheckForTexture(String.Format("ISO%02d%d%d", backdropId, shape, overlayId), TexMan.Type_Flat);
+			shadeWant = String.Format("%d %d %d", backdropId, shape, overlayId);
+		}
+		loadShadeMap(shadeWant);
+
+		// door passages: a few dark cells beyond every door, outward from the room
+		Array<bool> passage; passage.Resize(GW * GH);
+		for (int r = 0; r < h; r++)
+		{
+			for (int c = 0; c < w; c++)
+			{
+				int ch = gridChar(g, w, h, c, r);
+				if (ch != 68 && ch != 100) continue;   // 'D' / 'd'
+				// the passage runs away from the room: opposite to the door's floor-side neighbour
+				int dx = 0, dy = 0;
+				int up = gridChar(g, w, h, c, r - 1), dn = gridChar(g, w, h, c, r + 1);
+				int lf = gridChar(g, w, h, c - 1, r), rt = gridChar(g, w, h, c + 1, r);
+				if (isFloorChar(dn)) dy = -1;
+				else if (isFloorChar(up)) dy = 1;
+				else if (isFloorChar(rt)) dx = -1;
+				else if (isFloorChar(lf)) dx = 1;
+				else continue;
+				for (int k = 1; k <= PASSAGE_DEPTH; k++)
+				{
+					int pc = c + dx * k + M, pr = r + dy * k + M;
+					if (pc < 0 || pr < 0 || pc >= GW || pr >= GH) break;
+					passage[pr * GW + pc] = true;
+				}
+			}
+		}
+
+		for (int R = 0; R < GH; R++)
+		{
+			for (int C = 0; C < GW; C++)
+			{
+				int idx = R * GW + C;
+				int c = C - M, r = R - M;
+				int ch = gridChar(g, w, h, c, r);
+				bool inPassage = passage[idx];
+				if (inPassage) ch = 46;   // '.'
+				Sector s = cells[idx];
+				if (!s) continue;
+				double fh; String flat; String cls; int doorState;
+				cellParams(ch, fh, flat, cls, doorState, idx);
+				int tag = idx + 1;   // sector tag = cell index + 1 (set by build_pk3.py)
+				// open doorways and their passages get a lower ceiling; everything else the full height
+				bool crawl = backdropId == BACKDROP_CRAWLSPACE;
+				int targetCeil = (inPassage || ch == 68 || crawl) ? DOOR_CEIL : roomCeil();
+
+				double curCeil = s.ceilingplane.ZatPoint(s.centerspot);
+				double curFloor = s.floorplane.ZatPoint(s.centerspot);
+
+				// floor first (a closed door is a raised wall), then the ceiling
+				int delta = int(fh - curFloor);
+				if (delta > 0)
+				{
+					if (curCeil < fh - 4) Level.ExecuteSpecial(Ceiling_RaiseInstant, null, null, false, tag, 0, int(roomCeil() - curCeil) / 8);
+					Level.ExecuteSpecial(Floor_RaiseInstant, null, null, false, tag, 0, delta / 8);
+				}
+				else if (delta < 0) Level.ExecuteSpecial(Floor_LowerInstant, null, null, false, tag, 0, -delta / 8);
+				int cdelta = int(targetCeil - curCeil);
+				if (cdelta > 4) Level.ExecuteSpecial(Ceiling_RaiseInstant, null, null, false, tag, 0, cdelta / 8);
+				else if (cdelta < -4 && fh < targetCeil) Level.ExecuteSpecial(Ceiling_LowerInstant, null, null, false, tag, 0, -cdelta / 8);
+
+				int light = inPassage ? PASSAGE_LIGHT : (crawl ? 96 : ROOM_LIGHT);
+				if (curseDark) light = min(light, 20);
+				// pits keep the room's light: their floor flat is pure black anyway, and Doom lights
+				// a pit's side walls from the pit sector, so anything darker dims the walls
+				if (s.lightlevel != light) s.lightlevel = light;
+				// the ceiling sits in its own gloom (isaac_ceillight: light levels below the room's)
+				int ceilOff = -CVar.GetCVar('isaac_ceillight', players[consoleplayer]).GetInt();
+				if (s.GetPlaneLight(Sector.ceiling) != ceilOff) s.SetPlaneLight(Sector.ceiling, ceilOff);
+
+				TextureID t = (flat == "FLOOR0_3" || flat == "FLAT5_4") && floorTex.IsValid()
+					? floorTex : TexMan.CheckForTexture(flat, TexMan.Type_Flat);
+				// inside the room the plain floor carries Isaac's shadow overlay (baked per stage,
+				// room shape and overlay by build_sprites.py); the door passages keep the plain floor
+				if (t == floorTex && !inPassage && shadowTex.IsValid() && c >= 0 && r >= 0 && c < w && r < h) t = shadowTex;
+				if (t.IsValid() && s.GetTexture(Sector.floor) != t) s.SetTexture(Sector.floor, t);
+
+				// blocking prop (rock / poop) - only as a Doom stand-in; with Isaac art the grid sprite itself is solid
+				if (sprTableSize > 0) cls = "";
+				Actor a = gridActors[idx];
+				Name want = cls;
+				if (a && (cls == "" || a.GetClassName() != want)) { a.Destroy(); gridActors[idx] = null; a = null; }
+				if (!a && cls != "")
+				{
+					class<Actor> cl = want;
+					if (cl) gridActors[idx] = Actor.Spawn(cl, (C * CS + CS / 2, -(R * CS + CS / 2), fh));
+				}
+			}
+		}
+		curGrid = g;
+		instantNext = false;
+	}
+
+	// ---- laser beams --------------------------------------------------------
+	// "id:variant:scale:x,y,x,y,...|..." - one polyline per laser, Doom coordinates
+	Array<IsaacBeam> beams;
+	bool tearDbgShown; int tearDbgId, tearDbgCount;
+	const BEAM_Z = 34;          // ribbon fallback: just under eye level (41)
+	const BEAM_Z_FLAT = 22;     // Isaac's own beam art lying flat: well below the camera, so it visibly leaves from under you
+	Dictionary laserArt;        // variant -> "sprite frames w h" from ISLASER.txt (isaacui.pk3)
+
+	String laserSprite(int variant, out int frames, out double w, out double h)
+	{
+		frames = 0; w = 0; h = 0;
+		if (!laserArt)
+		{
+			laserArt = Dictionary.Create();
+			int lump = Wads.CheckNumForFullName("ISLASER.txt");
+			if (lump >= 0)
+			{
+				Array<String> lines; Wads.ReadLump(lump).Split(lines, "\n", TOK_SKIPEMPTY);
+				for (int i = 0; i < lines.Size(); i++)
+				{
+					Array<String> f; lines[i].Split(f, " ", TOK_SKIPEMPTY);
+					if (f.Size() >= 5) laserArt.Insert(f[0], f[1] .. " " .. f[2] .. " " .. f[3] .. " " .. f[4]);
+				}
+			}
+		}
+		String v = laserArt.At(String.Format("%d", variant));
+		if (v.Length() == 0) return "";
+		Array<String> f; v.Split(f, " ", TOK_SKIPEMPTY);
+		if (f.Size() < 4) return "";
+		if (!TexMan.CheckForTexture(f[0] .. "A0", TexMan.Type_Sprite).IsValid()) return "";
+		frames = f[1].ToInt(); w = f[2].ToDouble(); h = f[3].ToDouble();
+		return f[0];
+	}
+
+	IsaacBeam findBeam(int id)
+	{
+		for (int i = 0; i < beams.Size(); i++) if (beams[i] && beams[i].bid == id) return beams[i];
+		return null;
+	}
+
+	void applyBeams(String data, int seq)
+	{
+		if (!CVar.GetCVar('isaac_beams_on', players[consoleplayer]).GetBool()) { clearBeams(); return; }
+		Array<String> items;
+		data.Split(items, "|", TOK_SKIPEMPTY);
+		for (int i = 0; i < items.Size(); i++)
+		{
+			Array<String> f; items[i].Split(f, ":", TOK_KEEPEMPTY);
+			if (f.Size() < 4) continue;
+			int id = f[0].ToInt();
+			IsaacBeam b = findBeam(id);
+			if (!b)
+			{
+				b = IsaacBeam(Actor.Spawn("IsaacBeam", (players[consoleplayer].mo ? players[consoleplayer].mo.pos.x : 0, players[consoleplayer].mo ? players[consoleplayer].mo.pos.y : 0, 0)));
+				if (!b) continue;
+				b.bid = id; b.variant = f[1].ToInt();
+				beams.Push(b);
+			}
+			Array<String> c; f[3].Split(c, ",", TOK_SKIPEMPTY);
+			Array<double> pts;
+			int npts = c.Size() / 2;
+			int stride = max(1, (npts + 47) / 48);      // at most ~48 points per beam
+			for (int k = 0; k + 1 < c.Size(); k += 2 * stride) { pts.Push(c[k].ToDouble()); pts.Push(c[k + 1].ToDouble()); }
+			if (npts > 1 && stride > 1 && (npts - 1) % stride != 0) { pts.Push(c[c.Size() - 2].ToDouble()); pts.Push(c[c.Size() - 1].ToDouble()); }
+			// the player's own beam leaves from where the camera actually is, and follows the
+			// vertical aim it was fired with (Isaac has no up/down: this is Doom-side only)
+			int mineCode = f.Size() > 4 ? f[4].ToInt() : 0;
+			bool mine = mineCode == 1;                    // 2 = a Tech X ring: closed loop, lies flat, not anchored to the player
+			let pmo = players[consoleplayer].mo;
+			if (mine && pmo && pts.Size() >= 2)
+			{
+				pts[0] = pmo.pos.x; pts[1] = pmo.pos.y;
+				if (!b.pitchSet) { b.pitchSet = true; b.pitch = pmo.pitch; }
+			}
+			if (mineCode == 2 && !b.pitchSet) { b.pitchSet = true; b.pitch = 0; }
+			int frames; double aw, ah;
+			String art = laserSprite(b.variant, frames, aw, ah);
+			if (art.Length() > 0) b.updateFlat(pts, f[2].ToDouble(), BEAM_Z_FLAT, art, frames, aw, ah);
+			else b.update(pts, f[2].ToDouble(), BEAM_Z_FLAT);
+			b.seenSeq = seq;
+		}
+		for (int i = beams.Size() - 1; i >= 0; i--)
+		{
+			if (!beams[i]) { beams.Delete(i); continue; }
+			if (beams[i].seenSeq != seq) { beams[i].Destroy(); beams.Delete(i); }
+		}
+	}
+
+	void clearBeams()
+	{
+		for (int i = 0; i < beams.Size(); i++) if (beams[i]) beams[i].Destroy();
+		beams.Clear();
+	}
+
+	// ---- entities ---------------------------------------------------------
+
+	IsaacMirror findMirror(int id)
+	{
+		for (int i = 0; i < mirrors.Size(); i++)
+			if (mirrors[i] && mirrors[i].iid == id) return mirrors[i];
+		return null;
+	}
+
+	void applyEntities(String ents, int seq)
+	{
+		Array<String> items;
+		ents.Split(items, "|", TOK_SKIPEMPTY);
+		for (int i = 0; i < items.Size(); i++)
+		{
+			Array<String> f;
+			items[i].Split(f, ":", TOK_KEEPEMPTY);
+			if (f.Size() < 10) continue;
+			int id = f[0].ToInt();
+			IsaacMirror m = findMirror(id);
+			double x = f[4].ToDouble(), y = f[5].ToDouble();
+			// effects and stains that Isaac places on the room edge (tear poofs on walls, blood on
+			// the wall base) would sit inside Doom's solid wall cells and never be drawn: keep them
+			// just inside the room
+			if ((f[1] == "e" || f[1] == "d") && curW > 0 && curH > 0)
+			{
+				// (IsaacHandler.M: the local "m" below shadows the margin constant, names being case-insensitive)
+				double x0 = (IsaacHandler.M + 1) * CS + 6, x1 = (IsaacHandler.M + curW - 1) * CS - 6;
+				double y0 = -((IsaacHandler.M + curH - 1) * CS) + 6, y1 = -((IsaacHandler.M + 1) * CS) - 6;
+				x = clamp(x, x0, x1); y = clamp(y, y0, y1);
+			}
+			if (!m)
+			{
+				m = IsaacMirror(Actor.Spawn(f[1] == "s" ? "IsaacMirrorSolid" : "IsaacMirror", (x, y, 0)));
+				if (!m) continue;
+				m.iid = id;
+				m.kind = f[1];
+				m.itype = f[2].ToInt();
+				m.ivariant = f[3].ToInt();
+				m.isize = f[8].ToDouble();
+				m.boss = f[9].ToInt() != 0;
+				m.isub = f.Size() > 10 ? f[10].ToInt() : 0;
+				m.isaacHeight = f.Size() > 25 ? f[25].ToDouble() : 999;
+				m.setupLook();
+				if (m.kind == "t" && players[consoleplayer].mo)
+				{
+					m.tearPitch = players[consoleplayer].mo.pitch;
+					m.tearFrom = players[consoleplayer].mo.pos.xy;
+				}
+				mirrors.Push(m);
+			}
+			if (f.Size() > 11) m.label = f[11];
+			m.champ = f.Size() > 22 ? f[22].ToInt() : -1;
+			if (f.Size() > 23 && (m.kind == "t" || m.kind == "p" || m.kind == "d"))
+			{
+				String tc = f[23];
+				if (tc != m.tintCode)
+				{
+					m.tintCode = tc;
+					// a colourising translation (trnslate.txt): the art keeps its shading and outline,
+					// its light tones take the colour - the way Isaac tints the same tear sprite
+					if (tc == "222" || tc.Length() != 3) m.Translation = 0;
+					else m.A_SetTranslation("IST" .. tc);
+					m.dropTint();
+				}
+			}
+			if (f.Size() > 24) m.spriteScale = f[24].ToDouble();
+			if (f.Size() > 25) m.isaacHeight = f[25].ToDouble();
+			if (f.Size() > 26) m.isaacFall = f[26].ToDouble();
+			if (f.Size() > 28) { m.price = f[27].ToInt(); m.sale = f[28].ToInt(); }
+			if (f.Size() > 29) m.status = f[29].ToInt();
+			if (f.Size() > 30) m.flying = f[30].ToInt() != 0;
+			double ring = f.Size() > 21 ? f[21].ToDouble() : 0;
+			if (ring > 0) m.setRing(ring);
+			else if (f.Size() > 15 && sprTableSize > 0 && m.kind != "l") m.setIsaacAnim(f[12], f[13], f[14].ToInt(), f[15].ToInt() != 0);
+			if (f.Size() > 17)
+			{
+				double nhp = f[16].ToDouble();
+				// took damage: flash red like Isaac (not scenery that merely has HP: fireplaces, poops, TNT)
+				bool scenery = m.itype == 33 || m.anmKey.IndexOf("poop") >= 0 || m.anmKey.IndexOf("tnt") >= 0 || m.anmKey.IndexOf("fireplace") >= 0;
+				if (m.kind == "n" && !scenery && m.maxhp > 0 && nhp < m.hp) m.hitTics = 6;
+				m.hp = nhp; m.maxhp = f[17].ToDouble();
+			}
+			// burning enemies (and fiery ones) carry a flickering light
+			// Isaac says whether it burns (fireplaces: only while their flames play); the light follows that alone
+			bool fire = f.Size() > 20 && f[20].ToInt() != 0;
+			if (fire != m.onFire)
+			{
+				m.onFire = fire;
+				if (!fire) { m.A_RemoveLight("burn"); m.A_RemoveLight("fire"); }
+				else if (m.itype == 33) m.attachFireLight();
+				else m.A_AttachLightDef("burn", "ISAACFIRE");
+			}
+			// overlay animation (item pedestals etc.): a companion sprite at the same spot
+			if (f.Size() > 19 && f[18].Length() > 0 && sprTableSize > 0)
+			{
+				if (!m.overlay)
+				{
+					m.overlay = IsaacMirror(Actor.Spawn("IsaacMirror", m.pos));
+					if (m.overlay) { m.overlay.kind = "o"; m.overlay.ownerKind = m.kind; m.overlay.setupLook(); m.hasOverlay = true; }
+				}
+				if (m.overlay)
+				{
+					String baseKey = f[12];
+					int hash = baseKey.IndexOf("#");
+					if (hash >= 0) baseKey = baseKey.Left(hash);
+					m.overlay.setIsaacAnim(baseKey, f[18], f[19].ToInt(), f[15].ToInt() != 0);
+					m.placeOverlay(true);
+				}
+			}
+			else if (m.overlay) { m.overlay.Destroy(); m.overlay = null; m.hasOverlay = false; }
+			m.seenSeq = seq;
+			m.vel2 = (f[6].ToDouble(), f[7].ToDouble());
+			m.SetOrigin((x, y, m.pos.z), true);
+			if (m.kind == "t")
+			{
+				if (!tearDbgShown && m.iid != tearDbgId)
+				{
+					tearDbgId = m.iid; tearDbgCount++;
+					if (tearDbgCount >= 2) tearDbgShown = true;
+					Console.Printf("IsaacDoom: tear %d fields=%d isaac height=%.1f (999 = not reported: mod or bridge out of date)", m.iid, f.Size(), m.isaacHeight);
+				}
+				// Isaac's own arc (tears lose height and splat on the floor) around the eye line,
+				// plus the Doom-only vertical aim: drop/raise with the pitch it was fired at
+				double dist = (m.pos.xy - m.tearFrom).Length();
+				double z = 41 - tan(m.tearPitch) * dist;
+				if (m.isaacHeight < 500) z += (-m.isaacHeight * IsaacMirror.ISAAC_UNIT) - 37;     // a tear leaves the head ~23 px up
+				m.SetOrigin((x, y, max(2, z)), true);
+			}
+			if (m.kind == "K") m.bINVISIBLE = (m.pos.xy - isaacPlayerPos).Length() < 40;   // Mom's Knife in hand
+		}
+		// remove anything Isaac no longer reports
+		for (int i = mirrors.Size() - 1; i >= 0; i--)
+		{
+			if (!mirrors[i]) { mirrors.Delete(i); continue; }
+			if (mirrors[i].seenSeq != seq)
+			{
+				mirrors[i].vanish();
+				mirrors.Delete(i);
+			}
+		}
+	}
+
+	// Isaac grid entity art: "idx:type:anm2:anim:frame:flip|..."  ("=" unchanged, "-" none)
+	void applyGridSprites(String data)
+	{
+		if (data == "=" || sprTableSize == 0) return;
+		if (gridSprites.Size() != GW * GH) { gridSprites.Clear(); gridSprites.Resize(GW * GH); }
+		Array<bool> seen; seen.Resize(GW * GH);
+		if (rockActors.Size() != GW * GH) { rockActors.Clear(); rockActors.Resize(GW * GH); }
+		Array<bool> seenRock; seenRock.Resize(GW * GH);
+		if (data != "-")
+		{
+			Array<String> items;
+			data.Split(items, "|", TOK_SKIPEMPTY);
+			for (int i = 0; i < items.Size(); i++)
+			{
+				Array<String> f;
+				items[i].Split(f, ":", TOK_KEEPEMPTY);
+				if (f.Size() < 6) continue;
+				int gi = f[0].ToInt();
+				int c = gi % curW, r = gi / curW;
+				if (c + M >= GW || r + M >= GH) continue;
+				int idx = cellIndex(c, r);
+				seen[idx] = true;
+				int gt = f[1].ToInt();
+				int gch = gridChar(curGrid, curW, curH, c, r);
+				bool rubble = f.Size() > 6 && f[6].ToInt() != 0;     // a smashed rock: its remains lie on the floor
+				// plain rocks (GRID_ROCK / ROCKB / super-secret): a solid low-poly rock model, not a sprite
+				// (tinted rocks, GRID_ROCKT = 4, get the bevelled block with the tinted face)
+				class<Actor> rockCls = gt == 4 ? tintedModelClass(backdropId) : rockModelClass(backdropId);
+				if (!rubble && (gt == 2 || gt == 3 || gt == 4 || gt == 22) && gch == 82 && rockCls)
+				{
+					seenRock[idx] = true;
+					seen[idx] = false;
+					if (gridSprites[idx]) { gridSprites[idx].Destroy(); gridSprites[idx] = null; }
+					if (rockActors[idx] && rockActors[idx].GetClass() != rockCls) { rockActors[idx].Destroy(); rockActors[idx] = null; }
+					if (!rockActors[idx])
+					{
+						// on the floor; the model itself is offset down a little (MODELDEF) so its skirt is buried
+						let ra = Actor.Spawn(rockCls, ((c + M) * CS + CS / 2, -((r + M) * CS + CS / 2), 0));
+						if (ra)
+						{
+							if (gt == 4)
+							{
+								ra.angle = 0;                                     // a carved block sits square in its cell
+								ra.scale = (1.0, 1.0);
+							}
+							else
+							{
+								ra.angle = (idx * 47) % 360;                      // each rock turned its own way
+								double sv = 0.92 + ((idx * 31) % 17) / 100.0;     // ...and a touch bigger or smaller
+								ra.scale = (sv, sv);
+							}
+							rockActors[idx] = ra;
+						}
+					}
+					continue;
+				}
+				bool solid = gch == 82 || gch == 80;   // 'R' rock-like or 'P' poop: blocks in Isaac too
+				let g = gridSprites[idx];
+				if (g && g.bSOLID != solid) { g.Destroy(); g = null; }
+				if (!g)
+				{
+					g = IsaacGridSprite(Actor.Spawn(solid ? "IsaacGridSolid" : "IsaacGridSprite",
+						((c + M) * CS + CS / 2, -((r + M) * CS + CS / 2), 0)));
+					if (!g) continue;
+					gridSprites[idx] = g;
+				}
+				g.configure(rubble ? 1 : gt, c, r, curW, curH, M);   // rubble is placed like floor debris
+				g.rubble = rubble;
+				g.setIsaacAnim(f[2], f[3], f[4].ToInt(), f[5].ToInt() != 0);
+			}
+		}
+		for (int i = 0; i < GW * GH; i++)
+		{
+			if (!seen[i] && gridSprites[i]) { gridSprites[i].Destroy(); gridSprites[i] = null; }
+			if (!seenRock[i] && rockActors[i]) { rockActors[i].Destroy(); rockActors[i] = null; }
+		}
+	}
+
+	// rock model class for a backdrop (build_pk3.py generates IsaacRockNN per stage sheet)
+	class<Actor> rockModelClass(int bid)
+	{
+		Name n = String.Format("IsaacRock%02d", bid);
+		class<Actor> cl = n;
+		if (!cl) cl = "IsaacRock01";
+		return cl;
+	}
+
+	// the tinted rock's block model for a backdrop (IsaacRockTNN, same generator)
+	class<Actor> tintedModelClass(int bid)
+	{
+		Name n = String.Format("IsaacRockT%02d", bid);
+		class<Actor> cl = n;
+		if (!cl) cl = "IsaacRockT01";
+		if (!cl) cl = rockModelClass(bid);
+		return cl;
+	}
+
+	void applyMap(String data)
+	{
+		if (data == "=" || data.Length() == 0) return;
+		mapGi.Clear(); mapShape.Clear(); mapType.Clear(); mapFlags.Clear(); mapVisited.Clear();
+		Array<String> items;
+		data.Split(items, "|", TOK_SKIPEMPTY);
+		if (items.Size() == 0) return;
+		mapCurrent = items[0].ToInt();
+		for (int i = 1; i < items.Size(); i++)
+		{
+			Array<String> f;
+			items[i].Split(f, ":", TOK_KEEPEMPTY);
+			if (f.Size() < 5) continue;
+			mapGi.Push(f[0].ToInt()); mapShape.Push(f[1].ToInt()); mapType.Push(f[2].ToInt());
+			mapFlags.Push(f[3].ToInt()); mapVisited.Push(f[4].ToInt());
+		}
+	}
+
+	// cells (dx, dy) a room shape occupies, relative to its top-left grid index
+	clearscope static void shapeCells(int shape, Array<int> dxs, Array<int> dys)
+	{
+		dxs.Clear(); dys.Clear();
+		switch (shape)
+		{
+			case 4: case 5: dxs.Push(0); dys.Push(0); dxs.Push(0); dys.Push(1); break;            // 1x2 tall
+			case 6: case 7: dxs.Push(0); dys.Push(0); dxs.Push(1); dys.Push(0); break;            // 2x1 wide
+			case 8: dxs.Push(0); dys.Push(0); dxs.Push(1); dys.Push(0); dxs.Push(0); dys.Push(1); dxs.Push(1); dys.Push(1); break;
+			case 9:  dxs.Push(1); dys.Push(0); dxs.Push(0); dys.Push(1); dxs.Push(1); dys.Push(1); break;  // L missing top-left
+			case 10: dxs.Push(0); dys.Push(0); dxs.Push(0); dys.Push(1); dxs.Push(1); dys.Push(1); break;  // L missing top-right
+			case 11: dxs.Push(0); dys.Push(0); dxs.Push(1); dys.Push(0); dxs.Push(1); dys.Push(1); break;  // L missing bottom-left
+			case 12: dxs.Push(0); dys.Push(0); dxs.Push(1); dys.Push(0); dxs.Push(0); dys.Push(1); break;  // L missing bottom-right
+			default: dxs.Push(0); dys.Push(0); break;
+		}
+	}
+
+	clearscope static String roomLetter(int t)
+	{
+		switch (t)
+		{
+			case 2: return "$";    // shop
+			case 4: return "T";    // treasure
+			case 5: return "B";    // boss
+			case 6: return "M";    // miniboss
+			case 7: return "?";    // secret
+			case 8: return "??";   // super secret
+			case 9: return "A";    // arcade
+			case 10: return "C";   // curse
+			case 11: return "!";   // challenge
+			case 12: return "L";   // library
+			case 13: return "X";   // sacrifice
+			case 14: return "D";   // devil
+			case 15: return "H";   // angel
+			case 16: return "K";   // dungeon / crawlspace
+			case 18: return "P";   // planetarium
+			case 24: return "U";   // ultra secret
+			default: return "";
+		}
+	}
+
+	ui void drawArrow(double px, double py, double a, double len, Color col, double thick)
+	{
+		// triangle pointing along angle a (Doom angles: 90 = up on the map)
+		double dx = cos(a), dy = -sin(a);
+		double tipx = px + dx * len, tipy = py + dy * len;
+		double bx = px - dx * len * 0.7, by = py - dy * len * 0.7;
+		double lx = bx - dy * len * 0.6, ly = by + dx * len * 0.6;
+		double rx = bx + dy * len * 0.6, ry = by - dx * len * 0.6;
+		Screen.DrawThickLine(int(tipx), int(tipy), int(lx), int(ly), thick, col);
+		Screen.DrawThickLine(int(tipx), int(tipy), int(rx), int(ry), thick, col);
+		Screen.DrawThickLine(int(lx), int(ly), int(rx), int(ry), thick, col);
+		Screen.DrawThickLine(int(px), int(py), int(tipx), int(tipy), thick, col);
+	}
+
+	ui void drawMap(int sw, int sh, double s)
+	{
+		if (mapGi.Size() == 0) return;
+		double cell = (mapBig ? 22 : 11) * s;
+		double gap = 2 * s;
+		// centre the map on the current room
+		int cx = mapCurrent % 13, cy = mapCurrent / 13;
+		int span = mapBig ? 6 : 3;
+		double originX = sw - (2 * span + 1) * (cell + gap) - 12 * s;
+		double originY = 12 * s;
+		Array<int> dxs, dys;
+		for (int i = 0; i < mapGi.Size(); i++)
+		{
+			int gx = mapGi[i] % 13, gy = mapGi[i] / 13;
+			bool cur = mapGi[i] == mapCurrent;
+			bool vis = mapVisited[i] != 0;
+			bool shown = (mapFlags[i] & 1) != 0 || vis || cur;
+			if (!shown) continue;
+			Color col = cur ? Color(255, 255, 255, 255) : vis ? Color(255, 170, 170, 170) : Color(255, 70, 70, 70);
+			shapeCells(mapShape[i], dxs, dys);
+			for (int k = 0; k < dxs.Size(); k++)
+			{
+				int rx = gx + dxs[k] - cx + span, ry = gy + dys[k] - cy + span;
+				if (rx < 0 || ry < 0 || rx > 2 * span || ry > 2 * span) continue;
+				double x = originX + rx * (cell + gap), y = originY + ry * (cell + gap);
+				Screen.Clear(int(x), int(y), int(x + cell), int(y + cell), col);
+			}
+			String letter = roomLetter(mapType[i]);
+			if (letter.Length() > 0 && ((mapFlags[i] & 4) != 0 || vis))
+			{
+				int rx = gx - cx + span, ry = gy - cy + span;
+				if (rx >= 0 && ry >= 0 && rx <= 2 * span && ry <= 2 * span)
+				{
+					double x = originX + rx * (cell + gap), y = originY + ry * (cell + gap);
+					double ts = s * (mapBig ? 1.2 : 0.7);
+					double tw = SmallFont.StringWidth(letter) * ts;
+					Screen.DrawText(SmallFont, cur ? Font.CR_BLACK : Font.CR_GOLD, x + (cell - tw) / 2, y + (cell - 8 * ts) / 2, letter,
+						DTA_ScaleX, ts, DTA_ScaleY, ts);
+				}
+			}
+		}
+
+		// you: an arrow in the centre cell (the map is centred on the current room), pointing where you face
+		let pmo = players[consoleplayer].mo;
+		if (pmo)
+		{
+			double fx = clamp((pmo.pos.x - M * 64) / (curW * 64.0), 0.1, 0.9);
+			double fy = clamp((-pmo.pos.y - M * 64) / (curH * 64.0), 0.1, 0.9);
+			double px = originX + span * (cell + gap) + fx * cell;
+			double py = originY + span * (cell + gap) + fy * cell;
+			drawArrow(px, py, pmo.angle, cell * 0.5, Color(255, 255, 40, 40), max(2, 2.5 * s));
+		}
+	}
+
+	// combined boss HP, Isaac style (one bar for all boss segments in the room)
+	void updateBossBar()
+	{
+		double hp = 0, mx = 0; int n = 0;
+		for (int i = 0; i < mirrors.Size(); i++)
+		{
+			let m = mirrors[i];
+			if (m && m.kind == "n" && m.boss) { hp += m.hp; mx += m.maxhp; n++; }
+		}
+		if (n == 0) { bossMax = 0; bossHp = 0; bossShown = 0; return; }
+		if (bossMax <= 0 || mx > bossMax) bossMax = mx;
+		bossHp = hp;
+		// the pale "damage trail" catches up with the red bar
+		if (bossShown < bossHp) bossShown = bossHp;
+		else bossShown = max(bossHp, bossShown - bossMax * 0.01);
+	}
+
+	void clearEntities()
+	{
+		clearBeams();
+		for (int i = 0; i < mirrors.Size(); i++)
+			if (mirrors[i]) mirrors[i].Destroy();
+		mirrors.Clear();
+	}
+
+	void applyFx(String fx)
+	{
+		Array<String> items;
+		fx.Split(items, "|", TOK_SKIPEMPTY);
+		for (int i = 0; i < items.Size(); i++)
+		{
+			Array<String> f;
+			items[i].Split(f, ":", TOK_KEEPEMPTY);
+			if (f.Size() < 3) continue;
+			Vector3 p = (f[1].ToDouble(), f[2].ToDouble(), 24);
+			if (f[0] == "boom")
+			{
+				if (sprTableSize == 0) Actor.Spawn("IsaacExplosion", p);   // Isaac's explosion art is mirrored otherwise
+				else { Actor a = Actor.Spawn("IsaacExplosion", p); if (a) { a.bInvisible = true; } }
+				let pmo = players[consoleplayer].mo;
+				if (pmo) pmo.A_Quake(3, 12, 0, 640, "");
+			}
+		}
+	}
+
+	// ---- per tic ----------------------------------------------------------
+
+	Vector3 lastSafePos;
+	int trapFallStart;     // maptime the player dropped into an open trapdoor (0 = not falling)
+	double loadFade;       // 0 = clear, 1 = black; eases toward the loading state each tic
+	int loadTics;          // tics spent fully black in the loading state
+	Vector2 isaacPlayerPos;   // where Isaac says the character is (Doom units), updated every frame
+	int fellAt;
+
+	// UiTick keeps running while the game is paused (menu, pause key, console);
+	// world time does not. That is the only reliable pause signal, so Doom
+	// announces it explicitly instead of the bridge guessing from log silence.
+	override void UiTick()
+	{
+		if (gamestate != GS_LEVEL || !level) return;
+		int mt = level.maptime;
+		if (mt == uiLastMapTime) uiStalled++; else uiStalled = 0;
+		uiLastMapTime = mt;
+		bool p = uiStalled >= 4;   // ~0.11 s without a world tic
+		if (p != uiPaused)
+		{
+			uiPaused = p;
+			Console.PrintfEx(PRINT_HIGH | PRINT_NONOTIFY, "ISP %d%s", p ? 1 : 0, padding);
+		}
+	}
+
+	override void WorldTick()
+	{
+		pollInbound();
+		// door transitions fade out/in rather than cutting to a load screen
+		{
+			double target = bstate == 1 ? 1.0 : 0.0;
+			if (bstate == 3) { loadFade = 0; target = 0; }
+			if (loadFade < target) loadFade = min(target, loadFade + 0.2);
+			else if (loadFade > target) loadFade = max(target, loadFade - 0.12);
+			// how long we have been sitting on black: a "now loading" sign after a moment
+			// (room-to-room dips are far too quick to deserve one)
+			if (bstate == 1 && loadFade >= 0.98) loadTics++; else loadTics = 0;
+		}
+		// boss intro: hold the player still while the VS screen plays
+		if (players[consoleplayer].mo)
+		{
+			bool intro = introActive() || transActive();
+			if (intro) players[consoleplayer].cheats |= CF_TOTALLYFROZEN;
+			else if (players[consoleplayer].cheats & CF_TOTALLYFROZEN) players[consoleplayer].cheats &= ~CF_TOTALLYFROZEN;
+		}
+		// pedestal overlays share their item's spot: nudge them away from the
+		// camera so the renderer always draws the item in front of the pedestal
+		let cam = players[consoleplayer].mo;
+		if (cam)
+		{
+			for (int i = 0; i < mirrors.Size(); i++)
+			{
+				let m = mirrors[i];
+				if (!m) continue;
+				updateChampion(m, cam);
+				if (m.overlay) m.placeOverlay(false);
+				// the room's shadow overlay falls on the sprites too (not on fires or beams: they glow)
+				bool glows = (m.kind == "n" && m.itype == 33) || m.kind == "l";
+				if (!glows)
+				{
+					shadeActor(m);
+					if (m.overlay) { m.overlay.LightLevel = m.LightLevel; }
+				}
+			}
+			for (int i = 0; i < gridSprites.Size(); i++) if (gridSprites[i] && !gridSprites[i].bBRIGHT) shadeActor(gridSprites[i]);
+			for (int i = 0; i < rockActors.Size(); i++) shadeActor(rockActors[i]);
+		}
+		// stuck down a shaft with no floor change: lift the player back out
+		let pmo = players[consoleplayer].mo;
+		if (pmo)
+		{
+			// dropping into an open trapdoor: one quiet fall, fade to black, wait for the next floor
+			if (trapFallStart == 0 && pmo.pos.z < -4 && bstate == 0)
+			{
+				int c = int(floor(pmo.pos.x / CS)) - M, r = int(floor(-pmo.pos.y / CS)) - M;
+				if (gridChar(curGrid, curW, curH, c, r) == 84)
+				{
+					trapFallStart = level.maptime;
+					if (uiTexOk("IUNMBG")) { transStart = level.maptime + 18; transCardAt = 0; cardEndAt = 0; transNightmare = random(0, 99); }
+				}
+			}
+			if (trapFallStart > 0)
+			{
+				if (pmo.vel.z < -7) pmo.vel.z = -7;          // slow enough that Doomguy never grunts
+				if (level.maptime - trapFallStart > 35 * 10) trapFallStart = 0;   // Isaac never fell: give up
+			}
+			// pits are impassable in Isaac, which tests the player's centre against the cell. Same
+			// here: a centre that ended the tic inside a pit is put back on the nearest edge that
+			// borders walkable floor, keeping the rest of the motion - so you slide along pit edges
+			// and squeeze between diagonal pits exactly as in Isaac. (Solid blocker actors were
+			// tried: Doom's box collision against them sealed every diagonal gap.)
+			if (bstate == 0 && !playerFlying && trapFallStart == 0 && curGrid.Length() > 0)
+			{
+				int pc = int(floor(pmo.pos.x / CS)) - M, pr = int(floor(-pmo.pos.y / CS)) - M;
+				if (gridChar(curGrid, curW, curH, pc, pr) == 112)
+				{
+					double left = (pc + M) * CS, top = (pr + M) * CS;         // top = distance down from y 0
+					double fx = pmo.pos.x - left, fy = -pmo.pos.y - top;      // 0..CS inside the cell
+					double best = 1e9; Vector2 np = pmo.pos.xy;
+					if (!cellBlocked(pc - 1, pr) && fx < best)      { best = fx;      np = (left - 0.5, pmo.pos.y); }
+					if (!cellBlocked(pc + 1, pr) && CS - fx < best) { best = CS - fx; np = (left + CS + 0.5, pmo.pos.y); }
+					if (!cellBlocked(pc, pr - 1) && fy < best)      { best = fy;      np = (pmo.pos.x, -(top - 0.5)); }
+					if (!cellBlocked(pc, pr + 1) && CS - fy < best) { best = CS - fy; np = (pmo.pos.x, -(top + CS + 0.5)); }
+					if (best < 1e9)
+					{
+						pmo.SetOrigin((np.x, np.y, max(0, pmo.pos.z)), true);
+					}
+					else if (lastSafePos.z >= -1)
+					{
+						// pit on every side (dropped in from elsewhere): back to solid ground
+						pmo.SetOrigin((lastSafePos.x, lastSafePos.y, max(0, lastSafePos.z)), false);
+						pmo.vel = (0, 0, pmo.vel.z);
+					}
+				}
+			}
+			if (pmo.pos.z >= -1) { lastSafePos = pmo.pos; fellAt = 0; }
+			else if (fellAt == 0) fellAt = level.maptime;
+			else if (bstate == 0 && trapFallStart == 0 && level.maptime - fellAt > (pmo.pos.z <= -PIT_DEPTH + 4 ? 30 : 105))
+			{
+				// back to wherever Isaac's character actually is (never the hole we fell into)
+				Vector2 to = isaacPlayerPos.Length() > 0 ? isaacPlayerPos : lastSafePos.xy;
+				pmo.SetOrigin((to.x, to.y, 0), false);
+				pmo.vel = (0, 0, 0);
+				fellAt = 0;
+			}
+		}
+		// never leave the player overlapping a solid prop after a teleport (rocks that flank a doorway):
+		// push out along the shortest way
+		if (pmo && level.maptime % 2 == 0)
+		{
+			for (int i = 0; i < rockActors.Size() + gridSprites.Size(); i++)
+			{
+				Actor ra;
+				if (i < rockActors.Size()) ra = rockActors[i]; else ra = gridSprites[i - rockActors.Size()];
+				if (!ra || !ra.bSOLID) continue;
+				Vector2 d = pmo.pos.xy - ra.pos.xy;
+				double need = ra.radius + pmo.radius + 1;
+				double len = d.Length();
+				if (len >= need) continue;
+				if (len < 1) d = (1, 0); else d /= len;
+				pmo.SetOrigin((ra.pos.x + d.x * need, ra.pos.y + d.y * need, pmo.pos.z), false);
+			}
+		}
+		// floor specials are refused while a previous move on the same sector is
+		// still pending, so re-verify the whole grid regularly and patch misses
+		if (curGrid.Length() > 0 && level.maptime % 10 == 0) applyGrid(curGrid, curW, curH);
+		// unicorn: a rainbow sparkle trail streams off the player
+		if (unicorn && pmo)
+		{
+			for (int i = 0; i < 3; i++)
+			{
+				double h = (level.maptime * 9 + i * 120) % 360;
+				Color c = hsvColor(h);
+				pmo.A_SpawnParticle(c, SPF_FULLBRIGHT, 24, frandom(3, 6), frandom(0, 360),
+					frandom(-20, 20), frandom(-20, 20), frandom(8, 44),
+					frandom(-1, 1), frandom(-1, 1), frandom(0.5, 2.0), 0, 0, -0.05, 1.0, -1, -0.15);
+			}
+		}
+		writeOutbound();
+		if (fireTics > 0) fireTics--;
+		if (bombTics > 0) bombTics--;
+		if (useTics > 0) useTics--;
+		if (cardTics > 0) cardTics--;
+		if (restartTics > 0) restartTics--;
+	}
+
+	// key binds send these:  bind space "netevent isaac_use"   bind q "netevent isaac_card"
+	override void NetworkProcess(ConsoleEvent e)
+	{
+		if (e.Name == "isaac_use") useTics = 3;
+		else if (e.Name == "isaac_card") cardTics = 3;
+		else if (e.Name == "isaac_restart") restartTics = 3;
+		else if (e.Name == "isaac_bomb") bombTics = 3;
+		else if (e.Name == "isaac_newrun") { newRunId = e.Args[0]; newRunSlot = e.Args[1]; newRunTics = 6; }
+		else if (e.Name == "isaac_continue") { newRunId = 99; newRunSlot = e.Args[0]; newRunTics = 6; }
+		else if (e.Name == "isaac_challenge") { newRunId = 200 + e.Args[0]; newRunSlot = e.Args[1]; newRunTics = 6; }
+		else if (e.Name == "isaac_dropdown") dropHeld = true;
+		else if (e.Name == "isaac_dropup") dropHeld = false;
+		else if (e.Name == "isaac_map") mapBig = !mapBig;
+		if (e.Name == "isaac_newrun")
+		{
+			// a seed typed into the menu goes out on its own line, just before the request
+			let cv = CVar.FindCVar('isaac_seed');
+			String sd = cv ? cv.GetString() : "";
+			if (sd.Length() >= 8) Console.PrintfEx(PRINT_HIGH | PRINT_NONOTIFY, "ISSEED %s%s", sd, padding);
+			else Console.PrintfEx(PRINT_HIGH | PRINT_NONOTIFY, "ISSEED -%s", padding);
+		}
+	}
+
+	void pollInbound()
+	{
+		int seq = CVar.FindCVar('isaac_seq').GetInt();
+		if (seq == lastSeq) return;
+		lastSeq = seq;
+		gotFirstFrame = true;
+
+		// room
+		Array<String> rf;
+		CVar.FindCVar('isaac_room').GetString().Split(rf, ",", TOK_KEEPEMPTY);
+		int w = curW, h = curH, st = bstate;
+		if (rf.Size() >= 4)
+		{
+			w = rf[0].ToInt(); h = rf[1].ToInt(); st = rf[2].ToInt(); label = rf[3];
+		}
+		if (st == 3 && bstate != 3)
+		{
+			clearEntities();
+			Menu.SetMenu('MainMenu');      // Isaac is on its title screen: offer ours
+		}
+		if (st == 3) { bstate = 3; return; }
+		if (rf.Size() >= 5) backdropId = rf[4].ToInt();
+		if (rf.Size() >= 9)
+		{
+			int rt = rf[8].ToInt();
+			if (rt != roomType) { roomType = rt; curGrid = ""; }   // ceiling height depends on it: rebuild
+		}
+		if (rf.Size() >= 10)
+		{
+			int ov = rf[9].ToInt();
+			if (ov != overlayId) { overlayId = ov; curGrid = ""; }   // the floor flats carry the shadows: reapply
+		}
+		if (rf.Size() >= 8)
+		{
+			int ns = rf[5].ToInt(), nt = rf[6].ToInt();
+			// the tutorial drawing on the floor of the very first room (grid index 84 on floor 1)
+			bool wantDecal = ns == 1 && mapCurrent == 84 && uiTexOk("IUCTRL");
+			if (wantDecal && !controlsDecal)
+			{
+				controlsDecal = Actor.Spawn("IsaacFloorDecal", ((M + w / 2.0) * CS, -((M + h / 2.0) * CS), 2));
+				if (controlsDecal)
+				{
+					controlsDecal.picnum = TexMan.CheckForTexture("IUCTRL", TexMan.Type_Any);
+					controlsDecal.scale = (1.6, 1.6);
+					controlsDecal.angle = 90;
+					controlsDecal.bSPRITEFLIP = true;     // flat sprites come out mirrored otherwise
+				}
+			}
+			else if (!wantDecal && controlsDecal) { controlsDecal.Destroy(); controlsDecal = null; }
+			playerType = rf[7].ToInt();
+			stageNum = ns; stageType = nt;
+			// a new floor (or a new run) has arrived: Isaac is showing its stage card now, so
+			// show ours; the dream, if one was playing, ends here just like Isaac's
+			int sseq = CVar.FindCVar('isaac_stageseq').GetInt();
+			if (sseq != lastStageSeq)
+			{
+				lastStageSeq = sseq;
+				if (!dreamActive()) { transStart = level.maptime; transNightmare = -1; }
+				transCardAt = level.maptime;
+				cardEndAt = 0;
+			}
+			frozenNow = CVar.FindCVar('isaac_frozen').GetInt() != 0;
+			if (transCardAt > 0 && cardEndAt == 0)
+			{
+				int tc = level.maptime - transCardAt;
+				// Isaac resumed (or never froze, or is taking too long): let the card go
+				if ((tc > 20 && !frozenNow) || tc > 35 * 8) cardEndAt = level.maptime;
+			}
+		}
+
+		// item pickup popup
+		int pseq = CVar.FindCVar('isaac_popupseq').GetInt();
+		if (pseq != lastPopupSeq)
+		{
+			lastPopupSeq = pseq;
+			Array<String> pp;
+			CVar.FindCVar('isaac_popup').GetString().Split(pp, "|", TOK_KEEPEMPTY);
+			if (pp.Size() >= 1 && pp[0].Length() > 0)
+			{
+				popupName = pp[0];
+				popupDesc = pp.Size() > 1 ? pp[1] : "";
+				popupKind = pp.Size() > 2 ? pp[2] : "";
+				popupUntil = level.maptime + 35 * (popupKind == "f" ? 6 : 4);
+			}
+		}
+		if (backdropId != appliedBackdrop) applyBackdrop();
+		if (st != bstate)
+		{
+			int prev = bstate;
+			bstate = st;
+			if (bstate == 1) { loadingSince = level.maptime; clearEntities(); instantNext = true; applyGridSprites("-"); }
+			if (bstate == 2)
+			{
+				// Isaac died: freeze, flash, drop the view a little
+				clearEntities();
+				let pmo = players[consoleplayer].mo;
+				if (pmo) { players[consoleplayer].damagecount = 100; if (!haveIsaacSfx) pmo.A_StartSound("*death", CHAN_VOICE); }
+			}
+			else if (prev == 2)
+			{
+				// new run started in Isaac: fresh arena
+				level.ChangeLevel("MAP01", 0, CHANGELEVEL_NOINTERMISSION | CHANGELEVEL_RESETINVENTORY);
+				return;
+			}
+			setFrozen(bstate != 0);
+		}
+
+		// player / hud (teleport first, so a rising wall never traps the player)
+		Array<String> pf;
+		CVar.FindCVar('isaac_player').GetString().Split(pf, ",", TOK_KEEPEMPTY);
+		if (pf.Size() >= 9)
+		{
+			int oldHearts = hearts + soul;
+			hearts = pf[0].ToInt(); maxHearts = pf[1].ToInt(); soul = pf[2].ToInt();
+			bombs = pf[3].ToInt(); keys = pf[4].ToInt(); coins = pf[5].ToInt();
+			if (hearts + soul < oldHearts && players[consoleplayer].mo)
+				players[consoleplayer].damagecount = 40; // red flash
+			isaacPlayerPos = (pf[6].ToDouble(), pf[7].ToDouble());
+			bool fly = pf.Size() > 10 && pf[10].ToInt() != 0;
+			// Doomguy runs at Isaac's speed stat (Isaac speed 1.0 ~ 8.9 units/tic, Doom run ~ 16.7)
+			if (pf.Size() > 11 && players[consoleplayer].mo)
+				players[consoleplayer].mo.Speed = clamp(pf[11].ToDouble() * 0.53, 0.15, 1.5);
+			if (fly != playerFlying) { playerFlying = fly; curGrid = ""; }   // pits change depth: rebuild
+			if (pf[8].ToInt() == 1)
+			{
+				let pmo = players[consoleplayer].mo;
+				if (pmo)
+				{
+					pmo.SetOrigin((pf[6].ToDouble(), pf[7].ToDouble(), 0), false);
+					pmo.vel = (0, 0, 0);
+					if (pf.Size() > 9 && pf[9].ToInt() >= 0) pmo.A_SetAngle(pf[9].ToInt(), 0);
+					trapFallStart = 0;
+					if (transStart > 0 && transCardAt == 0 && transNightmare < 0) transStart = 0;
+					if (transStart > 0 && transCardAt > 0 && cardEndAt > 0 && level.maptime >= cardEndAt + CARD_FADE_TICS) { transStart = 0; transCardAt = 0; cardEndAt = 0; }
+				}
+			}
+		}
+		Array<String> hf;
+		CVar.FindCVar('isaac_hud').GetString().Split(hf, "|", TOK_KEEPEMPTY);
+		if (hf.Size() >= 4)
+		{
+			activeName = hf[0]; activeCharge = hf[1].ToInt(); activeMax = hf[2].ToInt(); pocketName = hf[3];
+			activeId = hf.Size() > 4 ? hf[4].ToInt() : 0;
+			trinketId = hf.Size() > 5 ? hf[5].ToInt() : 0;
+			heldKind = hf.Size() > 6 ? hf[6] : "";
+			heldId = hf.Size() > 7 ? hf[7].ToInt() : 0;
+		}
+		heartsStr = CVar.FindCVar('isaac_hearts').GetString();
+		// music follows Isaac's MusicManager
+		int mus = CVar.FindCVar('isaac_music').GetInt();
+		unicorn = CVar.FindCVar('isaac_unicorn').GetInt() != 0;
+		if (!musicLoop)
+		{
+			musicLoop = Dictionary.Create();
+			musicFast = Dictionary.Create();
+			musicAlt = Dictionary.Create();
+			int ml = Wads.CheckNumForFullName("ISMUSIC.txt");
+			haveIsaacMusic = ml >= 0;
+			if (ml >= 0)
+			{
+				Array<String> lines; Wads.ReadLump(ml).Split(lines, "\n", TOK_SKIPEMPTY);
+				for (int i = 0; i < lines.Size(); i++)
+				{
+					Array<String> f; lines[i].Split(f, " ", TOK_SKIPEMPTY);
+					if (f.Size() >= 2) musicLoop.Insert(f[0], f[1]);
+					if (f.Size() >= 3 && f[2] == "1") musicFast.Insert(f[0], "1");   // "id loop fast alt name"
+					if (f.Size() >= 4 && f[3] == "1") musicAlt.Insert(f[0], "1");    // your own track from altmusic\
+				}
+			}
+		}
+		bool fast = unicorn && musicFast.At(String.Format("%d", mus)) == "1";
+		if (mus != lastMusic || fast != lastFast)
+		{
+			lastMusic = mus; lastFast = fast;
+			String key = String.Format("%d", mus);
+			String lp = musicLoop.At(key);
+			// a track of your own (altmusic\) replaces the game's; it has no sped-up unicorn copy
+			bool alt = musicAlt.At(key) == "1";
+			if (mus > 0 && lp.Length() > 0)
+				S_ChangeMusic(String.Format(alt ? "IA%d" : (fast ? "IS%dF" : "IS%d"), mus), 0, lp == "1", true);
+			else if (mus <= 0 && haveIsaacMusic)
+				S_ChangeMusic("", 0, false, true);
+		}
+		// Isaac started a trapdoor fall: run the dream now, in step with the game
+		int fallSeq = CVar.FindCVar('isaac_fall').GetInt();
+		if (fallSeq != lastFallSeq)
+		{
+			bool first = !fallSeen;
+			fallSeen = true;
+			lastFallSeq = fallSeq;
+			if (!first && fallSeq > 0 && uiTexOk("IUNMBG"))
+			{
+				if (trapFallStart == 0) trapFallStart = level.maptime;
+				transStart = level.maptime + 12; transCardAt = 0; cardEndAt = 0; transNightmare = random(0, 99);
+			}
+		}
+		bool dark = (CVar.FindCVar('isaac_curse').GetInt() & 1) != 0;
+		if (dark != curseDark)
+		{
+			curseDark = dark;
+			curGrid = "";      // relight every sector on the next grid apply
+			let pmo = players[consoleplayer].mo;
+			if (pmo) { if (dark) pmo.A_AttachLightDef("isaac", "ISAACPLAYER"); else pmo.A_RemoveLight("isaac"); }
+		}
+		Array<String> inf;
+		CVar.FindCVar('isaac_intro').GetString().Split(inf, " ", TOK_SKIPEMPTY);
+		if (inf.Size() >= 5 && inf[0].ToInt() != introSeq)
+		{
+			// the first value seen is whatever fight Isaac last announced, possibly long
+			// before this Doom started: note it, play only the ones that arrive afterwards
+			bool fresh = introSeen;
+			introSeen = true;
+			introSeq = inf[0].ToInt();
+			if (introSeq > 0 && fresh)
+			{
+				introBoss = inf[1].ToInt(); introBoss2 = inf[2].ToInt(); introPlayer = inf[3].ToInt(); introSpot = inf[4];
+				introStart = level.maptime;
+			}
+		}
+
+		// grid (only when changed)
+		String g = CVar.FindCVar('isaac_grid').GetString();
+		if (g.Length() > 0 && (g != curGrid || w != curW || h != curH)) applyGrid(g, w, h);
+		applyGridSprites(CVar.FindCVar('isaac_gridspr').GetString());
+		applyMap(CVar.FindCVar('isaac_map').GetString());
+
+		// entities and one-shot effects
+		if (bstate == 0)
+		{
+			applyEntities(CVar.FindCVar('isaac_ents').GetString(), seq);
+			applyBeams(CVar.FindCVar('isaac_beams').GetString(), seq);
+			updateBossBar();
+		}
+		// Isaac's sounds, placed where Isaac says they happened. Also on the death screen:
+		// Isaac's death cry arrives in the same update that reports him dead.
+		if (bstate == 0 || bstate == 2)
+		{
+			int sfxseq = CVar.FindCVar('isaac_sfxseq').GetInt();
+			if (sfxseq != lastSfxSeq)
+			{
+				lastSfxSeq = sfxseq;
+				Array<String> items;
+				CVar.FindCVar('isaac_sfx').GetString().Split(items, "|", TOK_SKIPEMPTY);
+				for (int i = 0; i < items.Size(); i++)
+				{
+					Array<String> f; items[i].Split(f, ":", TOK_KEEPEMPTY);
+					if (f.Size() < 3) continue;
+					String snd = "isaac/" .. f[0];
+					double sx = f[1].ToDouble(), sy = f[2].ToDouble();
+					let pmo = players[consoleplayer].mo;
+					if (sx < 0 || !pmo)
+					{
+						if (pmo) pmo.A_StartSound(snd, CHAN_AUTO, CHANF_LOCAL, 1.0, ATTN_NONE);
+					}
+					else
+					{
+						if (curW > 0 && curH > 0)
+						{
+							sx = clamp(sx, (M + 1) * CS + 6, (M + curW - 1) * CS - 6);
+							sy = clamp(sy, -((M + curH - 1) * CS) + 6, -((M + 1) * CS) - 6);
+						}
+						Actor spot = Actor.Spawn("IsaacSoundSpot", (sx, sy, 32));
+						if (spot) spot.A_StartSound(snd, CHAN_AUTO, 0, 1.0, ATTN_NORM);
+					}
+				}
+			}
+			int fxseq = CVar.FindCVar('isaac_fxseq').GetInt();
+			if (fxseq != lastFxSeq)
+			{
+				lastFxSeq = fxseq;
+				applyFx(CVar.FindCVar('isaac_fx').GetString());
+			}
+		}
+	}
+
+	void writeOutbound()
+	{
+		let pmo = players[consoleplayer].mo;
+		if (!pmo) return;
+		String line = String.Format("IS %d %d %d %d %d %d %d %d %d %d %d %d %d",
+			level.maptime, int(pmo.pos.x), int(pmo.pos.y), int(pmo.angle) % 360,
+			fireTics > 0 ? 1 : 0, bombTics > 0 ? 1 : 0, lastSeq,
+			useTics > 0 ? 1 : 0, cardTics > 0 ? 1 : 0, restartTics > 0 ? 1 : 0,
+			newRunTics > 0 ? newRunId + 1 : 0, newRunTics > 0 ? newRunSlot : 0, dropHeld ? 1 : 0);
+		if (newRunTics > 0) newRunTics--;
+		// skip identical lines but heartbeat once a second
+		String key = line.Mid(line.IndexOf(" ", 3));
+		if (key == lastOut && level.maptime - lastOutTic < 10) return;   // idle heartbeat 3-4 times a second: its absence means Doom is paused
+		lastOut = key; lastOutTic = level.maptime;
+		Console.PrintfEx(PRINT_HIGH | PRINT_NONOTIFY, "%s%s", line, padding);
+	}
+
+	// ---- HUD --------------------------------------------------------------
+
+	// world point -> screen point for the current view. Returns false if behind the camera.
+	ui bool, double, double project(RenderEvent e, Vector3 w)
+	{
+		Vector3 d = w - e.ViewPos;
+		double ya = e.ViewAngle;
+		double fwd = d.x * cos(ya) + d.y * sin(ya);
+		double lft = -d.x * sin(ya) + d.y * cos(ya);
+		double p = -e.ViewPitch;
+		double xx = fwd * cos(p) + d.z * sin(p);
+		double zz = -fwd * sin(p) + d.z * cos(p);
+		if (xx < 4) return false, 0, 0;
+		double fov = players[consoleplayer].FOV;
+		if (fov <= 1) fov = 90;
+		double f = (Screen.GetHeight() / 2.0) / (tan(fov / 2) * 0.75);
+		double sx = Screen.GetWidth() / 2.0 - lft / xx * f;
+		double sy = Screen.GetHeight() / 2.0 - zz / xx * f;
+		return true, sx, sy;
+	}
+
+	override void RenderOverlay(RenderEvent e)
+	{
+		int sw = Screen.GetWidth(), sh = Screen.GetHeight();
+		double s = sh / 400.0;
+
+		if (trapFallStart > 0)
+		{
+			double a = clamp((level.maptime - trapFallStart) / 18.0, 0, 1);
+			Screen.Dim(Color(255, 0, 0, 0), a, 0, 0, sw, sh);
+			// the dream starts while we are still falling, in step with Isaac's own
+			if (a >= 1 && transActive()) { drawTransition(sw, sh); return; }
+			if (a >= 1) return;
+		}
+		if (bstate == 3)
+		{
+			Font fb = uiFont("ISUPHEAV", BigFont), fs = uiFont("ISMEAT12", SmallFont);
+			TextureID bg = uiTex("IUVSBG");
+			if (bg.IsValid()) Screen.DrawTexture(bg, false, 0, 0, DTA_DestWidth, sw, DTA_DestHeight, sh);
+			else Screen.Clear(0, 0, sw, sh, Color(255, 0, 0, 0));
+			double u = sh / 270.0;
+			String t1 = "THE BINDING OF ISAAC";
+			Screen.DrawText(fb, Font.CR_UNTRANSLATED, (sw - fb.StringWidth(t1) * u * 1.6) / 2, sh * 0.30, t1, DTA_ScaleX, u * 1.6, DTA_ScaleY, u * 1.6);
+			String t2 = "Escape: menu";
+			Screen.DrawText(fs, Font.CR_UNTRANSLATED, (sw - fs.StringWidth(t2) * u) / 2, sh * 0.70, t2, DTA_ScaleX, u, DTA_ScaleY, u);
+			return;
+		}
+		if (transActive()) { drawTransition(sw, sh); return; }
+		if (introActive()) { drawVersus(sw, sh); return; }
+		if (bstate == 2)
+		{
+			Screen.Dim(Color(255, 120, 0, 0), 0.55, 0, 0, sw, sh);
+			String t1 = "You died";
+			String t2 = "Press R for a new run";
+			Font fb = uiFont("ISUPHEAV", BigFont), fs = uiFont("ISMEAT12", SmallFont);
+			Screen.DrawText(fb, Font.CR_RED, (sw - fb.StringWidth(t1) * s * 1.5) / 2, sh * 0.30, t1,
+				DTA_ScaleX, s * 1.5, DTA_ScaleY, s * 1.5);
+			Screen.DrawText(fs, Font.CR_UNTRANSLATED, (sw - fs.StringWidth(t2) * s) / 2, sh * 0.42, t2,
+				DTA_ScaleX, s, DTA_ScaleY, s);
+			return;
+		}
+		// room change: a quick fade to black and back instead of a loading screen
+		if (loadFade > 0.001)
+		{
+			Screen.Dim(Color(255, 0, 0, 0), min(1.0, loadFade), 0, 0, sw, sh);
+			if (loadFade >= 0.98)
+			{
+				// a longer wait (Isaac walking its menus, a run loading): say so, Isaac-style
+				if (loadTics > 14) drawNowLoading(sw, sh, min(1.0, (loadTics - 14) / 10.0));
+				return;
+			}
+		}
+
+		// HUD safe area: pull everything in from the edges (VR headsets can't see the corners)
+		double inset = clamp(CVar.GetCVar('isaac_hudinset', players[consoleplayer]).GetFloat(), 0.0, 0.35);
+		hudK = 1.0; hudOx = 0; hudOy = 0;
+		if (inset > 0.001)
+		{
+			hudK = 1.0 - 2 * inset; hudOx = sw * inset; hudOy = sh * inset;
+			let xf = new("Shape2DTransform");
+			xf.Clear();
+			xf.Scale((hudK, hudK));
+			xf.Translate((hudOx, hudOy));
+			Screen.SetTransform(xf);
+		}
+
+		// unicorn: a soft rainbow wash cycling over everything
+		if (unicorn)
+		{
+			double h = (level.maptime * 6) % 360;
+			Screen.Dim(hsvColor(h), 0.16, 0, 0, sw, sh);
+		}
+
+		// Curse of the Lost: no map at all, like Isaac
+		bool curseLost = (CVar.FindCVar('isaac_curse').GetInt() & 4) != 0;
+		if (!curseLost) { if (uiTexOk("IM1FR")) drawIsaacMap(sw, sh); else drawMap(sw, sh, s); }
+
+		if (CVar.GetCVar('isaac_isaachud', players[consoleplayer]).GetBool() && uiTex("IUHRF").IsValid())
+			drawIsaacHud(e, sw, sh);
+		else
+			drawTextHud(e, sw, sh, s);
+		if (inset > 0.001) Screen.ClearTransform();
+	}
+	ui double hudK, hudOx, hudOy;   // current HUD transform (clip rectangles are not transformed by the engine)
+	ui int hx(double x) { return int(x * hudK + hudOx); }
+	ui int hy(double y) { return int(y * hudK + hudOy); }
+
+	// ---- Isaac-style HUD -------------------------------------------------
+	// Everything is laid out in Isaac's own 480x270 HUD space; u = one Isaac pixel.
+	const INTRO_TICS = 117;     // 100 Isaac frames at 30 fps
+
+	clearscope bool introActive()
+	{
+		return introStart > 0 && level.maptime - introStart < INTRO_TICS && uiTexOk("IUVSBG");
+	}
+	clearscope bool uiTexOk(String name) { return TexMan.CheckForTexture(name, TexMan.Type_Any).IsValid(); }
+
+	// place a versus-screen layer: Isaac coords are relative to the screen centre, 480x270 space
+	ui void vsLayer(String lump, double x, double y, double pivx, double pivy, double sx, double sy, double alpha, int sw, int sh, int style = -1)
+	{
+		TextureID t = uiTex(lump);
+		if (!t.IsValid() || alpha <= 0) return;
+		double u = sh / 270.0;
+		Vector2 sz = TexMan.GetScaledSize(t);
+		double w = sz.x * sx * u, h = sz.y * sy * u;
+		double px = sw / 2.0 + (x - pivx * sx) * u, py = sh / 2.0 + (y - pivy * sy) * u;
+		if (style >= 0)
+			Screen.DrawTexture(t, false, px, py, DTA_DestWidthF, w, DTA_DestHeightF, h, DTA_Alpha, alpha, DTA_TopLeft, true, DTA_LegacyRenderStyle, style);
+		else
+			Screen.DrawTexture(t, false, px, py, DTA_DestWidthF, w, DTA_DestHeightF, h, DTA_Alpha, alpha, DTA_TopLeft, true);
+	}
+
+	ui double easeOut(double t) { t = clamp(t, 0, 1); return 1 - (1 - t) * (1 - t) * (1 - t); }
+
+	ui void bossPivot(int id, out double px, out double py)
+	{
+		px = 96; py = 132;
+		if (!bossPivots)
+		{
+			bossPivots = Dictionary.Create();
+			int lump = Wads.CheckNumForFullName("IUVSDATA.txt");
+			if (lump >= 0)
+			{
+				Array<String> lines; Wads.ReadLump(lump).Split(lines, "\n", TOK_SKIPEMPTY);
+				for (int i = 0; i < lines.Size(); i++)
+				{
+					Array<String> f; lines[i].Split(f, " ", TOK_SKIPEMPTY);
+					if (f.Size() >= 4 && f[0] == "b") bossPivots.Insert(f[1], f[2] .. " " .. f[3]);
+				}
+			}
+		}
+		String v = bossPivots.At(String.Format("%d", id));
+		if (v.Length() > 0)
+		{
+			Array<String> f; v.Split(f, " ", TOK_SKIPEMPTY);
+			if (f.Size() >= 2) { px = f[0].ToDouble(); py = f[1].ToDouble(); }
+		}
+	}
+
+	ui void drawVersus(int sw, int sh)
+	{
+		double f = (level.maptime - introStart) * 30.0 / 35.0;     // Isaac frames
+		double u = sh / 270.0;
+		double fade = f < 90 ? 1.0 : clamp((100 - f) / 10.0, 0, 1);
+		// slide-in of the two sides (0..20) with the little overshoot Isaac has
+		double sl = easeOut(f / 20.0);
+		double bx = 400 + (86 - 400) * sl, px = -400 + (-145 + 400) * sl;
+		double a = clamp(f / 10.0, 0, 1) * fade;
+		double sq = f < 20 ? 1 + 0.08 * sin(f / 20.0 * 180) : 1;   // brief stretch while landing
+		Screen.Clear(0, 0, sw, sh, Color(255, 0, 0, 0));
+		vsLayer("IUVSBG", 0, 0, 392, 224, 1, 1, 1, sw, sh);
+		vsLayer("IUVB" .. introSpot, bx, 72, 122, 24, sq, 2 - sq, a, sw, sh);
+		vsLayer("IUVP" .. introSpot, px, 104, 90, 21, sq, 2 - sq, a, sw, sh);
+		double bpx, bpy; bossPivot(introBoss, bpx, bpy);
+		vsLayer(String.Format("IUBP%03d", introBoss), bx, 70, bpx, bpy, sq, 2 - sq, a, sw, sh);
+		if (introBoss2 > 0)
+		{
+			double b2x, b2y; bossPivot(introBoss2, b2x, b2y);
+			vsLayer(String.Format("IUBP%03d", introBoss2), bx + 60, 70, b2x, b2y, sq, 2 - sq, a, sw, sh);
+		}
+		vsLayer(String.Format("IUPP%02d", introPlayer), px, 104, 69, 128, sq, 2 - sq, a, sw, sh);
+		if (f >= 20)
+		{
+			double t = easeOut((f - 20) / 10.0);
+			vsLayer(String.Format("IUPN%02d", introPlayer), -142, -98, 112, 32, 1.1 - 0.1 * t, 0.9 + 0.1 * t, fade, sw, sh);
+			double vt = easeOut((f - 20) / 12.0);
+			vsLayer("IUVSVS", -22, -98, 64, 32, 3 - 2 * vt, 3 - 2 * vt, vt * fade, sw, sh);
+			double nt = easeOut((f - 20) / 40.0);
+			vsLayer(String.Format("IUBN%03d", introBoss), 400 + (117 - 400) * nt, -94, 82, 32,
+				1.86 - 0.86 * nt, 0.36 + 0.64 * nt, (0.5 + 0.5 * nt) * fade, sw, sh);
+		}
+	}
+
+	// ---- champions: a colour wash over the enemy, Isaac's palette ---------
+	void championColor(int idx, out Color col, out double alpha)
+	{
+		alpha = 0.5;
+		double t = level.maptime;
+		switch (idx)
+		{
+			case 0: col = Color(255, 255, 40, 40); break;             // red
+			case 1: col = Color(255, 255, 220, 40); break;            // yellow
+			case 2: col = Color(255, 60, 220, 60); break;             // green
+			case 3: col = Color(255, 60, 100, 255); break;            // blue
+			case 4: col = Color(255, 10, 10, 10); alpha = 0.7; break; // black
+			case 5: col = Color(255, 255, 255, 255); alpha = 0.45; break; // white
+			case 6: col = Color(255, 140, 140, 140); break;           // grey
+			case 7: col = Color(255, 255, 255, 255); alpha = 0; break; // transparent: handled on the base
+			case 8: col = Color(255, 255, 255, 255); alpha = (int(t / 4) % 2 == 0) ? 0.5 : 0; break; // flicker
+			case 9: col = Color(255, 255, 110, 200); break;           // pink
+			case 10: col = Color(255, 170, 50, 230); break;           // purple
+			case 11: col = Color(255, 140, 15, 15); alpha = 0.6; break; // dark red
+			case 12: col = Color(255, 140, 85, 35); break;            // brown
+			case 13: { double h = (t * 6) % 360; col = hsvColor(h); break; }   // rainbow
+			case 14: col = Color(255, 20, 20, 30); alpha = 0.65; break; // death
+			case 17: col = Color(255, 60, 220, 60); alpha = 0.3 + 0.3 * sin(t * 10); break; // pulse green
+			case 19: col = Color(255, 255, 220, 40); break;           // king
+			case 20: col = Color(255, 140, 140, 140); alpha = 0.3 + 0.3 * sin(t * 10); break;
+			case 21: col = Color(255, 255, 40, 40); alpha = 0.3 + 0.3 * sin(t * 10); break;
+			case 24: col = Color(255, 255, 255, 230); alpha = 0.4; break; // light
+			default: col = Color(255, 255, 255, 255); alpha = 0; break;
+		}
+	}
+
+	clearscope Color hsvColor(double h)
+	{
+		double x = 1 - abs((h / 60.0) % 2 - 1);
+		double r, g, b;
+		if (h < 60) { r = 1; g = x; b = 0; } else if (h < 120) { r = x; g = 1; b = 0; }
+		else if (h < 180) { r = 0; g = 1; b = x; } else if (h < 240) { r = 0; g = x; b = 1; }
+		else if (h < 300) { r = x; g = 0; b = 1; } else { r = 1; g = 0; b = x; }
+		return Color(255, int(r * 255), int(g * 255), int(b * 255));
+	}
+
+	// "rgb" tint code digits (0..2 each) -> the wash colour
+	static int tintLevel(int d) { return d <= 0 ? 76 : d == 1 ? 166 : 255; }
+	static Color tintCodeColor(String tc)
+	{
+		return Color(255, tintLevel(tc.ByteAt(0) - 48), tintLevel(tc.ByteAt(1) - 48), tintLevel(tc.ByteAt(2) - 48));
+	}
+
+	void updateChampion(IsaacMirror m, Actor cam)
+	{
+		bool hurt = m.hitTics > 0;
+		if (hurt) m.hitTics--;
+		if (m.kind != "n") { m.dropTint(); return; }
+		// champion colour as a colourising translation on the art itself (body and head layer),
+		// like the tear tints: shading and outline stay, the light tones take the colour
+		String want = m.status > 0 ? String.Format("ISS%02d", m.status) : championTranslation(m.champ);
+		if (want != m.champTrans)
+		{
+			m.champTrans = want;
+			if (want.Length() == 0) m.Translation = 0; else m.A_SetTranslation(want);
+			if (want.Length() > 0 && level.maptime - lastTintPrint > 35) { lastTintPrint = level.maptime; Console.Printf("IsaacDoom: enemy tint %s (status %d champ %d) on %s", want, m.status, m.champ, m.anmKey); }
+		}
+		if (m.overlay && m.overlay.champTrans != want)
+		{
+			m.overlay.champTrans = want;
+			if (want.Length() == 0) m.overlay.Translation = 0; else m.overlay.A_SetTranslation(want);
+		}
+		// the see-through and blinking kinds work on the sprite's own alpha
+		double a = 1.0;
+		if (m.champ == 7) a = 0.45;
+		else if (m.champ == 8) a = (int(level.maptime / 4) % 2 == 0) ? 1.0 : 0.15;
+		if (abs(m.alpha - a) > 0.01) { m.A_SetRenderStyle(a, a < 0.99 ? STYLE_Translucent : STYLE_Normal); }
+		if (m.overlay && abs(m.overlay.alpha - a) > 0.01) m.overlay.A_SetRenderStyle(a, a < 0.99 ? STYLE_Translucent : STYLE_Normal);
+		// the red hit flash stays a wash over every layer
+		if (!hurt || !m.picnum.IsValid()) { m.dropTint(); return; }
+		Color col = Color(255, 255, 40, 40);
+		m.applyTint(col, 0.6);
+		if (m.overlay && m.overlay.picnum.IsValid()) m.overlay.applyTint(col, 0.6);
+		else if (m.overlay) m.overlay.dropTint();
+	}
+
+	// translation lump for a champion colour index ("" = none / handled otherwise)
+	String championTranslation(int idx)
+	{
+		double t = level.maptime;
+		switch (idx)
+		{
+			case 0: case 1: case 2: case 3: case 4: case 5: case 6: case 9: case 10: case 11: case 12: case 14: case 19: case 24:
+				return String.Format("ISC%02d", idx);
+			case 13: return String.Format("ISCR%02d", int(t / 3) % 12);                 // rainbow
+			case 17: case 20: case 21:                                                     // pulsing: colour comes and goes
+				return (int(t / 12) % 2 == 0) ? String.Format("ISC%02d", idx) : "";
+		}
+		return "";
+	}
+
+	// ---- stage transition ------------------------------------------------
+	const CARD_FADE_TICS = 12;  // the card's fade-out once Isaac has resumed
+	const FADEIN_TICS = 88;     // the room fades in from black under the card, like Isaac's ~2.5 s
+
+	// when the card ends: a short fade-out after Isaac has resumed. 0 while it still shows.
+	clearscope int transEnd()
+	{
+		if (transCardAt == 0 || cardEndAt == 0) return 0;
+		return cardEndAt + CARD_FADE_TICS;
+	}
+
+	// the dream: from the fall until the new floor arrives (then the card takes over)
+	clearscope bool dreamActive()
+	{
+		if (transStart == 0 || transNightmare < 0 || level.maptime < transStart) return false;
+		if (transCardAt > 0) return false;
+		return level.maptime - transStart < 35 * 20;         // give up eventually
+	}
+
+	clearscope bool transActive()
+	{
+		if (transStart == 0 || level.maptime < transStart) return false;
+		if (level.maptime - transStart > 35 * 30) return false;
+		if (transCardAt == 0) return dreamActive();
+		int e = transEnd();
+		return e == 0 || level.maptime < e;
+	}
+
+	ui String nmInfo(int idx)
+	{
+		if (!nmData)
+		{
+			nmData = Dictionary.Create();
+			int lump = Wads.CheckNumForFullName("IUVSDATA.txt");
+			if (lump >= 0)
+			{
+				Array<String> lines; Wads.ReadLump(lump).Split(lines, "\n", TOK_SKIPEMPTY);
+				for (int i = 0; i < lines.Size(); i++)
+				{
+					Array<String> f; lines[i].Split(f, " ", TOK_SKIPEMPTY);
+					if (f.Size() >= 6 && f[0] == "n") nmData.Insert(f[1], f[2] .. " " .. f[3] .. " " .. f[4] .. " " .. f[5]);
+					if (f.Size() >= 2 && f[0] == "n") nmData.Insert("count", String.Format("%d", f[1].ToInt() + 1));
+				}
+			}
+		}
+		return nmData.At(String.Format("%d", idx));
+	}
+
+	// Levels frame for a stage (base progress sheet order)
+	ui int levelIcon(int st, int ty)
+	{
+		if (st <= 2) return ty == 1 ? 1 : ty == 2 ? 12 : 0;
+		if (st <= 4) return ty == 1 ? 3 : ty == 2 ? 13 : 2;
+		if (st <= 6) return ty == 1 ? 5 : ty == 2 ? 14 : 4;
+		if (st <= 8) return ty == 1 ? 7 : ty == 2 ? 15 : 6;
+		if (st == 9) return 16;
+		if (st == 10) return ty == 1 ? 9 : 8;
+		if (st == 11) return ty == 1 ? 11 : 10;
+		return 18;
+	}
+
+	// "now loading": the floor name we are heading for (or just Loading), Isaac's head
+	// bobbing beside it, and a trail of dots that walks while we wait
+	ui void drawNowLoading(int sw, int sh, double alpha)
+	{
+		double u = sh / 270.0;
+		Font fb = uiFont("ISUPHEAV", BigFont);
+		double ts = u * 1.4;
+		String text = "NOW LOADING";
+		int dots = (level.maptime / 12) % 4;
+		for (int i = 0; i < dots; i++) text = text .. ".";
+		double tw = fb.StringWidth("NOW LOADING...") * ts;
+		double x = (sw - tw) / 2, y = sh * 0.5 - fb.GetHeight() * ts / 2;
+		Screen.DrawText(fb, Font.CR_UNTRANSLATED, x, y, text, DTA_ScaleX, ts, DTA_ScaleY, ts, DTA_Alpha, alpha);
+		// Isaac's head (from the progress card art) hopping along beside the words
+		double hop = abs(sin(level.maptime * 9.0)) * 6;
+		vsLayer("IUPI00", -tw / (2 * u) - 14, -hop, 8, 8, 1, 1, alpha, sw, sh);
+		if (label.Length() > 0 && label != "Loading" && label != "Menu")
+		{
+			Font fs = uiFont("ISMEAT12", SmallFont);
+			double ss = u * 1.0;
+			Screen.DrawText(fs, Font.CR_UNTRANSLATED, (sw - fs.StringWidth(label) * ss) / 2, y + fb.GetHeight() * ts + 6 * u, label,
+				DTA_ScaleX, ss, DTA_ScaleY, ss, DTA_Alpha, alpha);
+		}
+	}
+
+	ui void drawTransition(int sw, int sh)
+	{
+		double u = sh / 270.0;
+		int t = level.maptime - transStart;
+		int e = transEnd();
+		// the card fades out once Isaac has resumed
+		double endFade = e > 0 ? clamp((e - level.maptime) / double(CARD_FADE_TICS), 0, 1) : 1.0;
+		if (transCardAt == 0)
+			Screen.Clear(0, 0, sw, sh, Color(255, 0, 0, 0));
+		else
+		{
+			// the room is drawn underneath: black lifting off it while Isaac's own fade-in runs
+			int tc = level.maptime - transCardAt;
+			double black = 1.0 - clamp(tc / double(FADEIN_TICS), 0, 1);
+			if (cardEndAt > 0) black = min(black, endFade);
+			if (black > 0) Screen.Dim(Color(255, 0, 0, 0), black, 0, 0, sw, sh);
+		}
+		if (transNightmare >= 0 && transCardAt == 0)
+		{
+			// the dream: dark room with Isaac in the spotlight, thought bubble above. It holds
+			// its last frame if the new floor is slow to arrive.
+			double fade = clamp(t / 12.0, 0, 1);
+			vsLayer("IUNMBG", 0, 0, 240, 135, 1, 1, fade, sw, sh);
+			double wob = sin(level.maptime * 12.0);
+			vsLayer(String.Format("IUPP%02d", playerType), wob, 29, 72, 48, 1, 1, fade, sw, sh);
+			String cnt = nmInfo(-1);
+			String countS = nmData ? nmData.At("count") : "";
+			int count = countS.Length() > 0 ? countS.ToInt() : 0;
+			if (count > 0 && transNightmare >= 0)
+			{
+				int idx = transNightmare % count;
+				String info = nmInfo(idx);
+				Array<String> f; info.Split(f, " ", TOK_SKIPEMPTY);
+				if (f.Size() >= 4)
+				{
+					int frames = f[0].ToInt(), step = f[3].ToInt();
+					int isaacFrame = int(t * 30.0 / 35.0);
+					int fi = clamp(isaacFrame / step, 0, frames - 1);
+					vsLayer(String.Format("IN%02d%03d", idx, fi), f[1].ToDouble(), f[2].ToDouble(), 0, 0, 1, 1, fade, sw, sh);
+				}
+			}
+		}
+		int tc = transCardAt > 0 ? level.maptime - transCardAt : t;
+		double fade = min(tc < 8 ? tc / 8.0 : 1.0, endFade);
+		if (transCardAt == 0)
+		{
+			// during the dream: the run's floors along the top, Isaac's head over the one he is
+			// falling to (Isaac shows this bar through its nightmare)
+			drawProgressRow(stageNum + 1, 0, -96, fade, sw, sh);
+			return;
+		}
+		// the stage card over the room fading in: the floor's name, centred, like Isaac's
+		Font fb = uiFont("ISUPHEAV", BigFont);
+		double ts = u * 1.6;
+		double tw = fb.StringWidth(label) * ts;
+		Screen.DrawText(fb, Font.CR_UNTRANSLATED, (sw - tw) / 2, sh / 2 - fb.GetHeight() * ts / 2, label, DTA_ScaleX, ts, DTA_ScaleY, ts, DTA_Alpha, fade);
+	}
+
+	// the run's floors as a row of icons, Isaac's head bobbing over floor `cur`
+	ui void drawProgressRow(int cur, int curType, double cy, double fade, int sw, int sh)
+	{
+		int slots = 8;
+		double pitch = 26;
+		double x0 = -(slots) * pitch / 2;
+		for (int i = 1; i <= slots + 1; i++)
+		{
+			double x = x0 + (i - 1) * pitch;
+			if (i <= slots)
+			{
+				bool done = i < cur, isCur = i == cur;
+				if (i > 1) vsLayer("IUPCN", x - pitch / 2, cy, 16, 16, 1, 1, fade, sw, sh);
+				vsLayer(done || isCur ? "IUPCF" : "IUPNC", x, cy, 16, 16, 1, 1, fade, sw, sh);
+				int icon = isCur ? levelIcon(cur, curType) : levelIcon(i, 0);
+				if (done || isCur) vsLayer(String.Format("IUPL%02d", icon), x, cy - 1, 16, 16, 1, 1, fade, sw, sh);
+				if (isCur) vsLayer("IUPI00", x, cy - 22 + sin(level.maptime * 10.0) * 1.5, 16, 16, 1, 1, fade, sw, sh);
+			}
+			else
+			{
+				vsLayer("IUPCN", x - pitch / 2, cy, 16, 16, 1, 1, fade, sw, sh);
+				vsLayer(cur > slots ? "IUPCF" : "IUPNC", x, cy, 16, 16, 1, 1, fade, sw, sh);
+				vsLayer("IUPBI", x, cy - 8, 16, 16, 1, 1, fade, sw, sh);
+				if (cur > slots) vsLayer("IUPI00", x, cy - 22, 16, 16, 1, 1, fade, sw, sh);
+			}
+		}
+	}
+
+	// ---- Isaac's minimap, with the game's own art -----------------------
+	ui String mapIconCode(int type)
+	{
+		switch (type)
+		{
+			case 2: return "SH"; case 4: return "TR"; case 5: return "BO"; case 6: return "MB";
+			case 7: return "SE"; case 8: return "SS"; case 9: return "AR"; case 10: return "CU";
+			case 11: return "AM"; case 12: return "LI"; case 13: return "SA"; case 14: return "DE";
+			case 15: return "AN"; case 16: return "LO"; case 17: return "BA"; case 18: return "IS";
+			case 19: return "BR"; case 20: return "CH"; case 21: return "DI"; case 24: return "PL";
+			case 25: return "TE"; case 29: return "US";
+		}
+		return "";
+	}
+
+	ui void drawIsaacMap(int sw, int sh)
+	{
+		if (mapGi.Size() == 0) return;
+		double u = sh / 270.0;
+		int idx = mapBig ? 2 : 1;
+		double pw = mapBig ? 18 : 9, ph = mapBig ? 16 : 8;     // cell pitch in the sheet's pixels
+		int cx = mapCurrent % 13, cy = mapCurrent / 13;
+		double ox, oy;          // screen position of the current room's cell
+		double mcx, mcy, R;     // the small map's round window: centre and radius (screen units)
+		if (!mapBig)
+		{
+			// a round window, top right, centred on the current room (isaac_mapinset pulls it
+			// further in from the corner, for headsets that can't see the edges)
+			double mi = CVar.GetCVar('isaac_mapinset', players[consoleplayer]).GetFloat() * u;
+			mcx = sw - (64 + 8) * u + 32 * u - mi; mcy = 6 * u + 32 * u + mi; R = 30 * u;
+			ox = mcx - pw * u / 2; oy = mcy - ph * u / 2;
+		}
+		else
+		{
+			Screen.Dim(Color(255, 0, 0, 0), 0.55, 0, 0, sw, sh);
+			mcx = sw / 2; mcy = sh / 2; R = 0;
+			ox = sw / 2 - pw * u / 2; oy = sh / 2 - ph * u / 2;
+		}
+		// heading-up mode (small map): the map turns around you so the way you face is always up,
+		// like a car's sat-nav. The big map stays north-up for reading.
+		let pmo = players[consoleplayer].mo;
+		bool gps = !mapBig && pmo && CVar.GetCVar('isaac_maprotate', players[consoleplayer]).GetBool();
+		double fx = 0.5, fy = 0.5;
+		if (pmo)
+		{
+			fx = clamp((pmo.pos.x - M * 64) / (curW * 64.0), 0.1, 0.9);
+			fy = clamp((-pmo.pos.y - M * 64) / (curH * 64.0), 0.1, 0.9);
+		}
+		double theta = gps ? pmo.angle - 90 : 0;      // screen rotation (y down) that puts the facing straight up
+		double px = ox + fx * pw * u, py = oy + fy * ph * u;    // where you are on the (unrotated) map
+		if (gps)
+		{
+			// pivot on you: shift the whole map so your spot sits at the window's centre
+			ox += mcx - px; oy += mcy - py;
+			px = mcx; py = mcy;
+		}
+		if (mapBig)
+		{
+			Screen.SetClipRect(hx(0), hy(0), hx(sw) - hx(0), hy(sh) - hy(0));
+			drawMapCells(ox, oy, px, py, theta, gps, pw, ph, u, cx, cy, idx);
+			Screen.ClearClipRect();
+		}
+		else
+		{
+			// the round window: the map is drawn in horizontal strips, each clipped to the
+			// circle's chord at that height, so nothing spills past the rim (the engine's
+			// per-draw clip is not honoured for rotated art, and a scissor can only be a box)
+			int STRIPS = 24;
+			double sh_ = 2 * R / STRIPS;
+			for (int k = 0; k < STRIPS; k++)
+			{
+				double y0 = mcy - R + k * sh_, ym = y0 + sh_ / 2;
+				double dy = ym - mcy;
+				double half = sqrt(max(0.0, R * R - dy * dy));
+				if (half < 1) continue;
+				// (the clip rectangle is the one thing the HUD transform doesn't cover: real pixels
+				// for it, HUD coordinates for the drawing itself)
+				int cl = hx(mcx - half), ct = hy(y0), cr = hx(mcx + half), cb = hy(y0 + sh_);
+				Screen.SetClipRect(cl, ct, max(1, cr - cl), max(1, cb - ct));
+				Screen.Dim(Color(255, 0, 0, 0), 0.6, int(mcx - half), int(y0), int(2 * half) + 1, int(sh_) + 1);
+				drawMapCells(ox, oy, px, py, theta, gps, pw, ph, u, cx, cy, idx);
+			}
+			Screen.ClearClipRect();
+			// the rim
+			drawRing(mcx, mcy, R + 1.5 * u, Color(255, 20, 16, 14), 3.0 * u);
+			drawRing(mcx, mcy, R + 0.5 * u, Color(255, 96, 82, 70), 1.2 * u);
+		}
+		// where you are in the room, and which way you face (straight up in heading-up mode)
+		if (pmo)
+			drawArrow(px, py, gps ? 90 : pmo.angle, (mapBig ? 7 : 3.5) * u, Color(255, 255, 40, 40), max(1.5, 1.2 * u));
+	}
+
+	ui void drawRing(double cx, double cy, double r, Color col, double thick)
+	{
+		int SEG = 40;
+		for (int i = 0; i < SEG; i++)
+		{
+			double a0 = i * 360.0 / SEG, a1 = (i + 1) * 360.0 / SEG;
+			Screen.DrawThickLine(int(cx + r * cos(a0)), int(cy + r * sin(a0)), int(cx + r * cos(a1)), int(cy + r * sin(a1)), thick, col);
+		}
+	}
+
+	// the map's rooms and icons (clip with Screen.SetClipRect before calling)
+	ui void drawMapCells(double ox, double oy, double px, double py, double theta, bool gps, double pw, double ph, double u, int cx, int cy, int idx)
+	{
+		for (int pass = 0; pass < 2; pass++)
+		for (int i = 0; i < mapGi.Size(); i++)
+		{
+			int gx = mapGi[i] % 13, gy = mapGi[i] / 13;
+			bool cur = mapGi[i] == mapCurrent;
+			bool vis = mapVisited[i] != 0;
+			bool shown = (mapFlags[i] & 1) != 0 || vis || cur;
+			if (!shown) continue;
+			double x = ox + (gx - cx) * pw * u, y = oy + (gy - cy) * ph * u;
+			if (pass == 0)
+			{
+				String code = cur ? "C" : vis ? "V" : "U";
+				TextureID t = uiTex(String.Format("IM%d%s%02d", idx, code, clamp(mapShape[i], 1, 12)));
+				if (!t.IsValid()) continue;
+				Vector2 sz = TexMan.GetScaledSize(t);
+				double w = sz.x * u, h = sz.y * u;
+				if (!gps)
+					Screen.DrawTexture(t, false, x, y, DTA_DestWidthF, w, DTA_DestHeightF, h, DTA_TopLeft, true);
+				else
+				{
+					// rotate the cell's centre about you, and the cell art by the same turn
+					double cxp = x + w / 2 - px, cyp = y + h / 2 - py;
+					double rx = px + cxp * cos(theta) - cyp * sin(theta), ry = py + cxp * sin(theta) + cyp * cos(theta);
+					Screen.DrawTexture(t, false, rx, ry, DTA_DestWidthF, w, DTA_DestHeightF, h, DTA_CenterOffset, true,
+						DTA_Rotate, -theta * MAP_ROT_SIGN);
+				}
+			}
+			else
+			{
+				String code = mapIconCode(mapType[i]);
+				if (code.Length() == 0 || !((mapFlags[i] & 4) != 0 || vis)) continue;
+				TextureID t = uiTex("IMI" .. code);
+				if (!t.IsValid()) continue;
+				double isz = (mapBig ? 16 : 8) * u;
+				if (!gps)
+					Screen.DrawTexture(t, false, x + (pw * u - isz) / 2, y + (ph * u - isz) / 2, DTA_DestWidthF, isz, DTA_DestHeightF, isz, DTA_TopLeft, true);
+				else
+				{
+					// icons keep their position in the turning lattice but stay upright, readable
+					double cxp = x + pw * u / 2 - px, cyp = y + ph * u / 2 - py;
+					double rx = px + cxp * cos(theta) - cyp * sin(theta), ry = py + cxp * sin(theta) + cyp * cos(theta);
+					Screen.DrawTexture(t, false, rx, ry, DTA_DestWidthF, isz, DTA_DestHeightF, isz, DTA_CenterOffset, true);
+				}
+			}
+		}
+	}
+	const MAP_ROT_SIGN = 1;    // flip to -1 if the room art turns the opposite way to the lattice
+
+	// a cell the player can't walk through (rock, wall, poop, pit, outside the room)
+	clearscope bool cellBlocked(int c, int r)
+	{
+		if (c < 0 || r < 0 || c >= curW || r >= curH) return true;
+		int ch = gridChar(curGrid, curW, curH, c, r);
+		return ch == 82 || ch == 87 || ch == 80 || ch == 120 || ch == 112;
+	}
+
+	ui TextureID uiTex(String name) { return TexMan.CheckForTexture(name, TexMan.Type_Any); }
+
+	ui Font uiFont(String name, Font fallback)
+	{
+		Font f = Font.GetFont(name);
+		return f ? f : fallback;
+	}
+
+	ui void drawTex(TextureID tex, double x, double y, double w, double h, double alpha = 1.0)
+	{
+		if (!tex.IsValid()) return;
+		Screen.DrawTexture(tex, false, x, y, DTA_DestWidthF, w, DTA_DestHeightF, h, DTA_Alpha, alpha, DTA_TopLeft, true);
+	}
+
+	// first frame of an item / trinket render from isaacsprites.pk3
+	ui TextureID itemTex(int id, bool trinket)
+	{
+		TextureID none; none.SetInvalid();
+		if (id <= 0 || !sprTable) return none;
+		String val = sprTable.At((trinket ? "005.350_trinket#" : "005.100_collectible#") .. id .. "|Idle");
+		if (val.Length() == 0) return none;
+		Array<String> toks; val.Split(toks, " ", TOK_SKIPEMPTY);
+		for (int i = 0; i < toks.Size(); i++)
+		{
+			if (toks[i] == "-") continue;
+			TextureID t = TexMan.CheckForTexture(toks[i] .. "0", TexMan.Type_Sprite);
+			if (t.IsValid()) return t;
+		}
+		return none;
+	}
+
+	// draw a sprite-sheet render fitted into a box, keeping its aspect
+	ui void drawFitted(TextureID tex, double x, double y, double box, double alpha = 1.0)
+	{
+		if (!tex.IsValid()) return;
+		Vector2 sz = TexMan.GetScaledSize(tex);
+		if (sz.x <= 0 || sz.y <= 0) return;
+		double k = min(box / sz.x, box / sz.y);
+		double w = sz.x * k, h = sz.y * k;
+		Screen.DrawTexture(tex, false, x + (box - w) / 2, y + (box - h) / 2, DTA_DestWidthF, w, DTA_DestHeightF, h,
+			DTA_Alpha, alpha, DTA_TopLeft, true);
+	}
+
+	ui void drawHeartToken(String tok, double x, double y, double u)
+	{
+		String kind = tok.Left(1);
+		int fill = tok.Length() > 1 ? tok.Mid(1, 1).ToInt() : 0;
+		String base = "";
+		if (kind == "R") base = fill == 2 ? "IUHRF" : fill == 1 ? "IUHRH" : "IUHRE";
+		else if (kind == "T") base = fill == 2 ? "IUHTF" : "IUHTH";
+		else if (kind == "C") base = fill == 2 ? "IUHCF" : fill == 1 ? "IUHCH" : "IUHCE";
+		else if (kind == "B") base = fill == 2 ? "IUHBF" : fill == 1 ? "IUHBH" : "IUHBE";
+		else if (kind == "U") base = fill == 2 ? "IUHUF" : "IUHUH";
+		else if (kind == "S") base = fill == 2 ? "IUHSF" : "IUHSH";
+		else if (kind == "K") base = fill == 2 ? "IUHKF" : "IUHKH";
+		else if (kind == "X") base = "IUHXX";
+		else if (kind == "H") base = "IUHHM";
+		else if (kind == "Q") base = "IUHCU";     // Curse of the Unknown: a single "?" heart
+		// a half heart sits in an empty container
+		if ((kind == "R" || kind == "T") && fill == 1) drawTex(uiTex("IUHRE"), x, y, 16 * u, 16 * u);
+		if ((kind == "B" || kind == "U") && fill == 1) drawTex(uiTex("IUHBE"), x, y, 16 * u, 16 * u);
+		if (base.Length() > 0) drawTex(uiTex(base), x, y, 16 * u, 16 * u);
+		if (tok.IndexOf("e") >= 0) drawTex(uiTex("IUHEH"), x, y, 16 * u, 16 * u);
+		if (tok.IndexOf("g") >= 0) drawTex(uiTex("IUHGO"), x, y, 16 * u, 16 * u);
+	}
+
+	// found HUD: value index (speed, tears, damage, range, shot speed, luck, devil, angel, planetarium)
+	// -> hudstats.anm2 icon frame, and a text stand-in when isaacui.pk3 predates the icons
+	static const int STAT_ICON[] = { 0, 1, 4, 2, 3, 5, 6, 7, 8 };
+	static const String STAT_LBL[] = { "SPD", "TRS", "DMG", "RNG", "SHT", "LCK", "DEV", "ANG", "PLN" };
+
+	// a pickup's price the way Isaac shows it: a coin count, hearts for devil deals, or a word
+	ui void drawPrice(IsaacMirror m, double cx, double top, double u)
+	{
+		Font num = uiFont("ISMEAT12", SmallFont);
+		int p = m.price;
+		double ts = u * 0.75, ih = 12 * u;
+		if (p > 0)
+		{
+			String t = String.Format("%d", p);
+			double tw = num.StringWidth(t) * ts, w = ih + 2 * u + tw;
+			double x = cx - w / 2;
+			drawTex(uiTex("IUPCOIN"), x, top, ih, ih);
+			Screen.DrawText(num, Font.CR_UNTRANSLATED, x + ih + 2 * u, top + (ih - num.GetHeight() * ts) / 2, t, DTA_ScaleX, ts, DTA_ScaleY, ts);
+			if (m.sale > p)
+			{
+				// on sale: the old price struck through beside it
+				String o = String.Format("%d", m.sale);
+				double ow = num.StringWidth(o) * ts;
+				double ox = x + w + 4 * u;
+				Screen.DrawText(num, Font.CR_DARKGRAY, ox, top + (ih - num.GetHeight() * ts) / 2, o, DTA_ScaleX, ts, DTA_ScaleY, ts);
+				Screen.Dim(Color(255, 200, 40, 40), 0.9, int(ox), int(top + ih / 2), int(ow), max(1, int(u)));
+			}
+			return;
+		}
+		String toks = "";
+		String word = "";
+		switch (p)
+		{
+			case -1: toks = "R2"; break;
+			case -2: toks = "R2 R2"; break;
+			case -3: toks = "S2 S2 S2"; break;
+			case -4: toks = "R2 S2 S2"; break;
+			case -7: toks = "S2"; break;
+			case -8: toks = "S2 S2"; break;
+			case -9: toks = "R2 S2"; break;
+			case -5: word = "SPIKES"; break;
+			case -6: word = "YOUR SOUL"; break;
+			case -1000: word = "FREE"; break;
+			default: word = String.Format("%d", p); break;
+		}
+		if (toks.Length() > 0)
+		{
+			Array<String> tk; toks.Split(tk, " ", TOK_SKIPEMPTY);
+			double w = tk.Size() * ih, x = cx - w / 2;
+			for (int i = 0; i < tk.Size(); i++) drawHeartToken(tk[i], x + i * ih, top, u * 0.75);
+		}
+		else
+		{
+			double tw = num.StringWidth(word) * ts;
+			Screen.DrawText(num, Font.CR_UNTRANSLATED, cx - tw / 2, top, word, DTA_ScaleX, ts, DTA_ScaleY, ts);
+		}
+	}
+
+	ui void drawIsaacHud(RenderEvent e, int sw, int sh)
+	{
+		double u = sh / 270.0;
+		Font big = uiFont("ISUPHEAV", BigFont);
+		Font num = uiFont("ISTEMPST", SmallFont);
+		Font small = uiFont("ISMEAT10", SmallFont);
+		Font desc = uiFont("ISMEAT12", SmallFont);
+
+		// active item + charge bar (top left)
+		double ax = 8 * u, ay = 10 * u, abox = 32 * u;
+		if (activeId > 0)
+		{
+			drawFitted(itemTex(activeId, false), ax, ay, abox);
+			if (activeMax > 0)
+			{
+				double bx = ax + abox + 2 * u, by = ay;
+				drawTex(uiTex("IUCBE"), bx, by, 16 * u, 32 * u);
+				// the full bar, clipped from the top by the missing charge
+				double frac = clamp(double(activeCharge) / activeMax, 0, 1);
+				int clipTop = int(by + (1 - frac) * 32 * u);
+				TextureID full = uiTex("IUCBF");
+				if (full.IsValid())
+					Screen.DrawTexture(full, false, bx, by, DTA_DestWidthF, 16 * u, DTA_DestHeightF, 32 * u,
+						DTA_ClipTop, clipTop, DTA_TopLeft, true);
+				TextureID ov = uiTex(String.Format("IUCO%d", activeMax));
+				if (ov.IsValid()) drawTex(ov, bx, by, 16 * u, 32 * u);
+			}
+		}
+
+		// hearts: rows of six, 12 px apart, starting right of the charge bar
+		double hx0 = 60 * u, hy0 = 12 * u;
+		Array<String> toks;
+		heartsStr.Split(toks, " ", TOK_SKIPEMPTY);
+		for (int i = 0; i < toks.Size(); i++)
+		{
+			int col = i % 6, row = i / 6;
+			drawHeartToken(toks[i], hx0 + col * 12 * u, hy0 + row * 10 * u, u);
+		}
+
+		// coins / bombs / keys under the active item
+		double px = 14 * u, py = 46 * u, pitch = 12 * u;
+		for (int i = 0; i < 3; i++)
+		{
+			double y = py + i * pitch;
+			drawTex(uiTex(i == 0 ? "IUPCOIN" : i == 1 ? "IUPBOMB" : "IUPKEY"), px, y, 16 * u, 16 * u);
+			String t = String.Format("%02d", i == 0 ? coins : i == 1 ? bombs : keys);
+			Screen.DrawText(num, Font.CR_UNTRANSLATED, px + 18 * u, y + (16 * u - num.GetHeight() * u) / 2 + 1 * u, t,
+				DTA_ScaleX, u, DTA_ScaleY, u);
+		}
+
+		// Isaac's found HUD: the stats down the left side under the pickups
+		if (CVar.GetCVar('isaac_stathud', players[consoleplayer]).GetBool())
+		{
+			Array<String> sv;
+			CVar.FindCVar('isaac_stats').GetString().Split(sv, ",", TOK_KEEPEMPTY);
+			if (sv.Size() >= 6)
+			{
+				double sy0 = py + 3 * pitch + 6 * u, sp = 10 * u;
+				int row = 0;
+				for (int i = 0; i < 9 && i < sv.Size(); i++)
+				{
+					double v = sv[i].ToDouble();
+					if (i >= 6 && v < 0) continue;          // chance the game doesn't expose
+					String t = i >= 6 ? String.Format("%.2f%%", v) : String.Format("%.2f", v);
+					double y = sy0 + row * sp;
+					TextureID ic = uiTex(String.Format("IUST%d", STAT_ICON[i]));
+					if (ic.IsValid()) drawTex(ic, px, y, 10 * u, 10 * u);
+					else Screen.DrawText(small, Font.CR_DARKGRAY, px, y + 1 * u, STAT_LBL[i], DTA_ScaleX, u * 0.5, DTA_ScaleY, u * 0.5);
+					Screen.DrawText(small, Font.CR_UNTRANSLATED, px + 13 * u, y + (10 * u - small.GetHeight() * u * 0.6) / 2, t,
+						DTA_ScaleX, u * 0.6, DTA_ScaleY, u * 0.6);
+					row++;
+				}
+			}
+		}
+
+		// trinket and pocket item, bottom left
+		if (trinketId > 0) drawFitted(itemTex(trinketId, true), 8 * u, sh - 44 * u, 32 * u);
+		if (pocketName.Length() > 0)
+		{
+			String pk = heldKind == "p" ? "Pill: " : heldKind == "c" ? "Card: " : "";
+			Screen.DrawText(small, Font.CR_UNTRANSLATED, 44 * u, sh - 30 * u, pk .. pocketName, DTA_ScaleX, u, DTA_ScaleY, u);
+		}
+
+		// fortune: the lines of the reading over the ink smear
+		if (level.maptime < popupUntil && popupKind == "f")
+		{
+			double fade = min(1.0, (popupUntil - level.maptime) / 20.0);
+			Array<String> lines; popupDesc.Split(lines, " / ", TOK_SKIPEMPTY);
+			double lh = desc.GetHeight() * u * 1.05;
+			double streakH = max(34 * u, lines.Size() * lh + 12 * u);
+			drawTex(uiTex("IUSTREAK"), (sw - 260 * u) / 2, 40 * u, 260 * u, streakH, 0.85 * fade);
+			for (int i = 0; i < lines.Size(); i++)
+			{
+				double dw = desc.StringWidth(lines[i]) * u;
+				Screen.DrawText(desc, Font.CR_UNTRANSLATED, (sw - dw) / 2, 40 * u + 6 * u + i * lh, lines[i],
+					DTA_ScaleX, u, DTA_ScaleY, u, DTA_Alpha, fade);
+			}
+		}
+		// item pickup streak: ink smear with the name and the pickup quote
+		else if (level.maptime < popupUntil && popupName.Length() > 0)
+		{
+			double fade = min(1.0, (popupUntil - level.maptime) / 20.0);
+			double nameScale = u * 1.15;
+			double tw = big.StringWidth(popupName) * nameScale;
+			double streakW = max(tw + 80 * u, 220 * u), streakH = 34 * u;
+			drawTex(uiTex("IUSTREAK"), (sw - streakW) / 2, 40 * u, streakW, streakH, 0.85 * fade);
+			Screen.DrawText(big, Font.CR_UNTRANSLATED, (sw - tw) / 2, 44 * u + (streakH - big.GetHeight() * nameScale) / 2 - 4 * u,
+				popupName, DTA_ScaleX, nameScale, DTA_ScaleY, nameScale, DTA_Alpha, fade);
+			if (popupDesc.Length() > 0)
+			{
+				double dw = desc.StringWidth(popupDesc) * u;
+				Screen.DrawText(desc, Font.CR_UNTRANSLATED, (sw - dw) / 2, 40 * u + streakH + 2 * u, popupDesc,
+					DTA_ScaleX, u, DTA_ScaleY, u, DTA_Alpha, fade);
+			}
+		}
+
+		// boss bar, bottom centre, Isaac's own frame
+		if (bossMax > 0)
+		{
+			double bw = 131 * u, bh = 20 * u;
+			double bx = (sw - bw) / 2, by = sh - 34 * u;
+			drawTex(uiTex("IUBOSSBG"), bx, by, bw, bh);
+			TextureID fg = uiTex("IUBOSSFG");
+			if (fg.IsValid())
+			{
+				double fx = bx + 17 * u, fy = by + 6 * u, fw = 110 * u, fh = 8 * u;
+				double shown = clamp(bossShown / bossMax, 0, 1), cur = clamp(bossHp / bossMax, 0, 1);
+				Screen.DrawTexture(fg, false, fx, fy, DTA_DestWidthF, fw, DTA_DestHeightF, fh, DTA_TopLeft, true,
+					DTA_FillColor, Color(255, 235, 200, 180), DTA_ClipRight, int(fx + fw * shown));
+				Screen.DrawTexture(fg, false, fx, fy, DTA_DestWidthF, fw, DTA_DestHeightF, fh, DTA_TopLeft, true,
+					DTA_FillColor, Color(255, 200, 30, 30), DTA_ClipRight, int(fx + fw * cur));
+			}
+		}
+
+		// Mom's Knife in hand: draw it first-person, blade pointing away, like Isaac holds it
+		for (int i = 0; i < mirrors.Size(); i++)
+		{
+			let m = mirrors[i];
+			if (!m || m.kind != "K" || !m.bINVISIBLE || !m.picnum.IsValid()) continue;
+			Vector2 sz = TexMan.GetScaledSize(m.picnum);
+			double k = (sh * 0.42) / max(1, sz.y);
+			double w = sz.x * k * 1.1, h = sz.y * k * 0.62;     // squashed = foreshortened
+			double bob = sin(level.maptime * 9.0) * 3 * u;
+			Screen.DrawTexture(m.picnum, false, sw * 0.5 + 26 * u, sh - h * 0.42 + bob,
+				DTA_DestWidthF, w, DTA_DestHeightF, h, DTA_Rotate, 180, DTA_CenterOffset, true, DTA_FlipX, m.bSPRITEFLIP);
+			break;
+		}
+
+		// pickups walled in by rocks: show the item floating above with an arrow, like a marker
+		let cam = players[consoleplayer].mo;
+		for (int i = 0; i < mirrors.Size(); i++)
+		{
+			let mk = mirrors[i];     // (not "m": ZScript names are case-insensitive and M is the margin)
+			if (!mk || mk.kind != "k" || !mk.picnum.IsValid() || !cam) continue;
+			int c = int(floor(mk.pos.x / CS)) - M, r = int(floor(-mk.pos.y / CS)) - M;
+			if (!cellBlocked(c - 1, r) || !cellBlocked(c + 1, r) || !cellBlocked(c, r - 1) || !cellBlocked(c, r + 1)) continue;
+			Vector3 wp = mk.pos; wp.z = 96 + sin(level.maptime * 6.0) * 4;
+			bool ok; double sx, sy;
+			[ok, sx, sy] = project(e, wp);
+			if (!ok || sx < -200 || sx > sw + 200) continue;
+			double dist = max(64, (mk.pos.xy - cam.pos.xy).Length());
+			double px = clamp(sh * 90.0 / dist, 12, sh * 0.25);
+			Vector2 sz = TexMan.GetScaledSize(mk.picnum);
+			double k = px / max(sz.x, sz.y);
+			Screen.DrawTexture(mk.picnum, false, sx - sz.x * k / 2, sy - sz.y * k, DTA_DestWidthF, sz.x * k, DTA_DestHeightF, sz.y * k, DTA_TopLeft, true);
+			// a chevron in Isaac's own font, outlined, bobbing with the item
+			Font vf = uiFont("ISUPHEAV", BigFont);
+			double vs = max(0.5, px / 40.0);
+			double vw = vf.StringWidth("V") * vs;
+			double vx = sx - vw / 2, vy = sy + 2 * u;
+			for (int ox = -1; ox <= 1; ox++) for (int oy = -1; oy <= 1; oy++)
+				if (ox != 0 || oy != 0)
+					Screen.DrawText(vf, Font.CR_BLACK, vx + ox * 1.5 * u, vy + oy * 1.5 * u, "V", DTA_ScaleX, vs, DTA_ScaleY, vs);
+			Screen.DrawText(vf, Font.CR_UNTRANSLATED, vx, vy, "V", DTA_ScaleX, vs, DTA_ScaleY, vs);
+		}
+
+		// floating names over pickups, and the price under the name in shops / deals
+		for (int i = 0; i < mirrors.Size(); i++)
+		{
+			let m = mirrors[i];
+			if (!m || (m.label.Length() == 0 && m.price == 0)) continue;
+			Vector3 wp = m.Prev + (m.pos - m.Prev) * e.FracTic;
+			wp.z += 40 * m.scale.y + 8;
+			bool ok; double sx, sy;
+			[ok, sx, sy] = project(e, wp);
+			if (!ok || sx < -200 || sx > sw + 200) continue;
+			double ts = u * 0.7;
+			if (m.label.Length() > 0)
+			{
+				double tw = small.StringWidth(m.label) * ts;
+				Screen.DrawText(small, Font.CR_UNTRANSLATED, sx - tw / 2, sy - small.GetHeight() * ts, m.label, DTA_ScaleX, ts, DTA_ScaleY, ts);
+			}
+			if (m.price != 0) drawPrice(m, sx, sy + 2 * u, u);
+		}
+
+		if (!gotFirstFrame)
+			Screen.DrawText(SmallFont, Font.CR_RED, 8 * u, sh - 12 * u, "no data from bridge", DTA_ScaleX, u * 0.5, DTA_ScaleY, u * 0.5);
+	}
+
+	// ---- plain text HUD (fallback when isaacui.pk3 is missing) ----------
+	ui void drawTextHud(RenderEvent e, int sw, int sh, double s)
+	{
+
+		// item pickup popup, Isaac style: big name, description under it
+		if (level.maptime < popupUntil && popupName.Length() > 0)
+		{
+			double fade = min(1.0, (popupUntil - level.maptime) / 20.0);
+			double ts = s * 1.6;
+			double tw = BigFont.StringWidth(popupName) * ts;
+			Screen.DrawText(BigFont, Font.CR_WHITE, (sw - tw) / 2, sh * 0.16, popupName,
+				DTA_ScaleX, ts, DTA_ScaleY, ts, DTA_Alpha, fade);
+			if (popupDesc.Length() > 0)
+			{
+				double ds = s * 1.0;
+				double dw = SmallFont.StringWidth(popupDesc) * ds;
+				Screen.DrawText(SmallFont, Font.CR_GRAY, (sw - dw) / 2, sh * 0.16 + 26 * ts, popupDesc,
+					DTA_ScaleX, ds, DTA_ScaleY, ds, DTA_Alpha, fade);
+			}
+		}
+
+		// boss health bar, bottom centre
+		if (bossMax > 0)
+		{
+			int bw = int(sw * 0.36), bh = int(14 * s);
+			int bx = (sw - bw) / 2, by = sh - int(36 * s);
+			Screen.Clear(bx - int(3 * s), by - int(3 * s), bx + bw + int(3 * s), by + bh + int(3 * s), Color(255, 20, 10, 10));
+			Screen.Clear(bx, by, bx + bw, by + bh, Color(255, 50, 25, 25));
+			Screen.Clear(bx, by, bx + int(bw * clamp(bossShown / bossMax, 0, 1)), by + bh, Color(255, 230, 190, 170));
+			Screen.Clear(bx, by, bx + int(bw * clamp(bossHp / bossMax, 0, 1)), by + bh, Color(255, 200, 30, 30));
+			String t = "BOSS";
+			double ts = s * 0.8;
+			Screen.DrawText(SmallFont, Font.CR_WHITE, bx - SmallFont.StringWidth(t) * ts - 8 * s, by + (bh - 8 * ts) / 2, t,
+				DTA_ScaleX, ts, DTA_ScaleY, ts);
+		}
+
+		// floating names over pickups
+		for (int i = 0; i < mirrors.Size(); i++)
+		{
+			let m = mirrors[i];
+			if (!m || m.label.Length() == 0) continue;
+			Vector3 wp = m.Prev + (m.pos - m.Prev) * e.FracTic;
+			wp.z += 40 * m.scale.y + 8;
+			bool ok; double sx, sy;
+			[ok, sx, sy] = project(e, wp);
+			if (!ok || sx < -200 || sx > sw + 200) continue;
+			double ts = s * 0.9;
+			double tw = SmallFont.StringWidth(m.label) * ts;
+			Screen.DrawText(SmallFont, Font.CR_WHITE, sx - tw / 2, sy - 8 * ts, m.label, DTA_ScaleX, ts, DTA_ScaleY, ts);
+		}
+
+		// hearts, Isaac style: one box per heart, half fills
+		int x0 = int(12 * s), y0 = int(12 * s), hw = int(14 * s), gap = int(4 * s);
+		int slots = maxHearts / 2;
+		for (int i = 0; i < slots; i++)
+		{
+			int x = x0 + i * (hw + gap);
+			Screen.Clear(x, y0, x + hw, y0 + hw, Color(255, 60, 20, 20));
+			int filled = clamp(hearts - i * 2, 0, 2);
+			if (filled == 2) Screen.Clear(x, y0, x + hw, y0 + hw, Color(255, 230, 40, 40));
+			else if (filled == 1) Screen.Clear(x, y0, x + hw / 2, y0 + hw, Color(255, 230, 40, 40));
+		}
+		int soulSlots = (soul + 1) / 2;
+		for (int i = 0; i < soulSlots; i++)
+		{
+			int x = x0 + (slots + i) * (hw + gap);
+			int filled = clamp(soul - i * 2, 0, 2);
+			if (filled == 2) Screen.Clear(x, y0, x + hw, y0 + hw, Color(255, 80, 140, 255));
+			else Screen.Clear(x, y0, x + hw / 2, y0 + hw, Color(255, 80, 140, 255));
+		}
+		int ly = y0 + hw + int(6 * s);
+		int lh = int(12 * s);
+		String inv = String.Format("Coins %d   Bombs %d   Keys %d", coins, bombs, keys);
+		Screen.DrawText(SmallFont, Font.CR_GOLD, x0, ly, inv, DTA_ScaleX, s, DTA_ScaleY, s); ly += lh;
+		Screen.DrawText(SmallFont, Font.CR_GRAY, x0, ly, label, DTA_ScaleX, s, DTA_ScaleY, s); ly += lh;
+		if (activeName.Length() > 0)
+		{
+			String a = activeMax > 0 ? String.Format("Active: %s  [%d/%d]", activeName, activeCharge, activeMax)
+			                         : String.Format("Active: %s", activeName);
+			Screen.DrawText(SmallFont, activeCharge >= activeMax ? Font.CR_GREEN : Font.CR_DARKGRAY, x0, ly, a,
+				DTA_ScaleX, s, DTA_ScaleY, s); ly += lh;
+		}
+		if (pocketName.Length() > 0)
+		{
+			Screen.DrawText(SmallFont, Font.CR_CYAN, x0, ly, "Pocket: " .. pocketName, DTA_ScaleX, s, DTA_ScaleY, s); ly += lh;
+		}
+		if (!gotFirstFrame)
+			Screen.DrawText(SmallFont, Font.CR_RED, x0, ly, "no data from bridge", DTA_ScaleX, s, DTA_ScaleY, s);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// A ghost actor that stands in for one Isaac entity. No AI, no collision:
+// Isaac owns the simulation, this only draws a Doom sprite where Isaac says.
+// ---------------------------------------------------------------------------
+class IsaacMirror : Actor
+{
+	int iid;
+	String kind;
+	int itype, ivariant, isub;
+	double isize;
+	bool boss;
+	int seenSeq;
+	double hp, maxhp;
+	Vector2 vel2;
+	int walkFrames;   // how many walk frames the chosen sprite has
+	String label;     // floating name (pickups)
+	IsaacMirror overlay;   // companion sprite for Isaac's overlay animation (pedestals...)
+	bool hasOverlay;
+	int champ;             // Isaac champion colour index, -1 = normal
+	int hitTics;           // red flash after Isaac reports lost HP
+	bool fireLit;          // fireplaces: light attached while the fire still burns
+	String ownerKind;      // overlay companions: kind of the entity they belong to
+	double tearPitch;      // player tears: Doom pitch when fired (Isaac has no vertical aim)
+	Vector2 tearFrom;      // ...and where they started, so the arc is purely cosmetic
+	String tintCode;       // quantised sprite colour ("222" = white) for tears / shots
+	IsaacMirror tint;      // colour wash drawn over the sprite for champions
+	int price, sale;       // shop / devil price (coins > 0, heart prices < 0, -1000 free) and the pre-sale price
+	double fitFactor;      // extra scale (<= 1) that keeps a huge sprite under the ceiling; the head layer shares it
+	String champTrans;     // champion colour translation currently applied ("" = none)
+	Array<Actor> cord;     // umbilical cord beads (familiars with status 100)
+	bool flying;           // Isaac says it flies: hovers above the floor instead of standing on it
+	int status;            // status effect recolouring the enemy (1 frozen, 2 poisoned, 3 slowed, 4 charmed, 5 feared, 6 gold, 7 burning, 8 bleeding, 9 confused)
+	Actor shadow;          // floor blob under shots / tears: shows where they are on the floor plane
+	Actor tailDot;         // small grey bead on the tail of a flat directional shot: visible head-on
+	int trailTic;          // last tic a trail ghost was dropped
+	double zoff;      // hover height above the floor
+	double spriteScale;    // Isaac's SpriteScale.X (creep puddles grow and shrink with it)
+	double isaacHeight;    // Isaac's Height for tears / shots / bombs (negative = above the floor), 999 = none
+	double isaacFall;      // ...and its FallingSpeed (Isaac px per frame, positive = down), for smooth motion between updates
+	int hitFlash;
+	String anmKey, anmAnim;   // current Isaac animation
+	int directional;          // 0 unknown, 1 = art drawn pointing along its travel (nails, bones...), 2 = no
+	Array<String> anmTokens;  // sprite+frame token per Isaac frame index
+	bool isaacSprite;         // true while drawing a real Isaac frame
+	const ISAAC_SCALE = 1.6;  // 40 px Isaac cell -> 64 Doom units
+	const ISAAC_UNIT = 1.6;   // Isaac pixels -> Doom units, for heights
+
+	Default
+	{
+		+NOGRAVITY
+		+NOBLOCKMAP
+		+NOINTERACTION
+		+NOTELEPORT
+		+DONTSPLASH
+		+NOBLOOD
+		Radius 8;
+		Height 16;
+	}
+
+	States
+	{
+	Spawn:
+		TNT1 A -1;
+		Stop;
+	}
+
+	void setLook(String spr, double sc, int frames = 1)
+	{
+		sprite = GetSpriteIndex(spr);
+		frame = 0;
+		scale = (sc, sc);
+		walkFrames = frames;
+	}
+
+	void attachFireLight()
+	{
+		String def = "ISAACFIRE";
+		if (ivariant == 1) def = "ISAACFIRERED";
+		else if (ivariant == 2) def = "ISAACFIREBLUE";
+		else if (ivariant == 3) def = "ISAACFIREPURP";
+		else if (ivariant == 4) def = "ISAACFIREWHITE";
+		A_AttachLightDef("fire", def);
+	}
+
+	virtual void setupLook()
+	{
+		// (fireplaces light the room while Isaac reports them burning: see the entity update)
+		double sc = clamp(isize / 14.0, 0.35, 3.0);
+		if (kind == "n")
+		{
+			switch (itype)
+			{
+				case 10: setLook("POSS", 1.0, 4); break;   // Gaper
+				case 11: setLook("SPOS", 1.0, 4); break;   // Gusher
+				case 12: setLook("HEAD", 0.5, 1); break;   // Horf
+				case 13: setLook("SKUL", 0.35, 2); break;  // Fly
+				case 14: setLook("SKUL", 0.45, 2); break;  // Pooter
+				case 15: setLook("TROO", 0.8, 4); break;   // Clotty
+				case 16: setLook("POSS", 0.9, 4); break;   // Mulligan
+				case 17: setLook("KEEN", 1.0, 1); break;   // Shopkeeper
+				case 18: setLook("SKUL", 0.4, 2); break;   // Attack fly
+				case 19: setLook("HEAD", 0.9, 1); break;   // Larry Jr segments
+				case 20: setLook("BOSS", 1.4, 4); break;   // Monstro
+				case 21: setLook("SARG", 0.5, 4); break;   // Maggot
+				case 22: setLook("FATT", 0.9, 4); break;   // Hive
+				case 23: setLook("SARG", 0.7, 4); break;   // Charger
+				case 24: setLook("TROO", 0.9, 4); break;   // Globin
+				case 25: setLook("PAIN", 0.5, 1); break;   // Boom fly
+				case 26: setLook("HEAD", 0.7, 1); break;   // Maw
+				case 27: setLook("CPOS", 0.8, 4); break;   // Host
+				case 28: setLook("FATT", 1.2, 4); break;   // Chub
+				case 29: setLook("TROO", 0.6, 4); break;   // Hopper
+				case 30: setLook("BSPI", 0.5, 1); break;   // Boil
+				case 31: setLook("SARG", 0.7, 4); break;   // Spitty
+				case 32: setLook("HEAD", 0.6, 1); break;   // Brain
+				case 33: setLook("FCAN", 1.0, 1); break;   // Fireplace
+				case 34: setLook("SARG", 0.8, 4); break;   // Leaper
+				case 35: setLook("HEAD", 0.8, 1); break;   // Mr. Maw
+				case 36: setLook("FATT", 1.5, 4); break;   // Gurdy
+				case 38: setLook("SKUL", 0.5, 2); break;   // Baby
+				case 39: setLook("HEAD", 0.6, 1); break;   // Vis
+				case 40: setLook("BOSS", 1.0, 4); break;   // Guts
+				case 41: setLook("BOSS", 0.9, 4); break;   // Knight
+				case 45: setLook("SPID", 0.8, 4); break;   // Mom
+				case 62: setLook("BSPI", 1.0, 1); break;   // Pin
+				case 67: setLook("PAIN", 1.2, 1); break;   // Duke of Flies
+				case 68: setLook("BOSS", 1.2, 4); break;   // Peep
+				case 79: setLook("BOSS", 1.1, 4); break;   // Gemini
+				case 85: setLook("BSPI", 0.35, 1); break;  // Spider
+				case 94: setLook("BSPI", 0.7, 1); break;   // Big spider
+				default:
+					if (boss) setLook("BOSS", max(sc, 1.2), 4);
+					else setLook("POSS", sc, 4);
+					break;
+			}
+		}
+		else if (kind == "p") { setLook("BAL1", 0.5, 1); zoff = shotHeight(); }   // enemy projectile
+		else if (kind == "t") { setLook("APLS", 0.4, 2); zoff = 41; }       // player tear, at eye height
+		else if (kind == "K") { setLook("BAL1", 0.4, 1); zoff = 30; }
+		else if (kind == "l") { setLook("TNT1", 1.0); zoff = 30; }       // drawn by IsaacBeam along the laser's path
+		else if (kind == "s") setLook("BAR1", 1.2);          // slot machine / beggar stand-in
+		else if (kind == "o" || kind == "x") setLook("TNT1", 1.0);   // overlay / tint companions: invisible until set
+		else if (kind == "e")
+		{
+			setLook("TNT1", 1.0);
+			// tear / bullet poofs happen at tear height; explosions and gibs on the ground
+			if (ivariant == 10 || ivariant == 11 || ivariant == 12 || ivariant == 13 || ivariant == 79 || ivariant == 80) zoff = 30;
+		}
+		else if (kind == "d")
+		{
+			// creep / splats / gibs / floor decorations: flat on the floor, stacked so they don't fight
+			setLook("TNT1", 1.0);
+			bFLATSPRITE = true;
+			bSPRITEFLIP = true;
+			angle = 90;
+			bool creep = (ivariant >= 22 && ivariant <= 26) || ivariant == 56 || ivariant == 94 || ivariant == 155
+				|| ivariant == 169 || ivariant == 195 || ivariant == 168 || ivariant == 32 || ivariant == 37
+				|| (ivariant >= 44 && ivariant <= 46) || ivariant == 53 || ivariant == 54 || ivariant == 78
+				|| ivariant == 90 || ivariant == 92;
+			zoff = (ivariant == 140 ? 0.3 : creep ? 1.0 : 0.6) + (iid % 5) * 0.06;
+		}
+		else if (kind == "b") setLook("BAR1", 0.6, 1);       // bomb
+		else if (kind == "f") setLook("SKUL", 0.3, 2);       // familiar
+		else if (kind == "k")
+		{
+			switch (ivariant)
+			{
+				case 10:  // hearts: red kinds -> medikit, soul/black -> soulsphere
+					if (isub == 3 || isub == 6 || isub == 8 || isub == 10 || isub == 11) setLook("SOUL", 0.45);
+					else setLook("MEDI", 0.7);
+					break;
+				case 20: setLook("YSKU", 0.8); break;    // coin
+				case 30: setLook("YKEY", 0.9); break;    // key
+				case 40: setLook("ROCK", 0.7); break;    // bomb pickup
+				case 50: case 51: case 52: case 53: case 54: case 55: case 56:
+				case 57: case 58: case 60: case 360:
+					setLook("BPAK", 1.2); break;         // chests
+				case 69: setLook("BPAK", 0.9); break;    // sack
+				case 90: setLook("CELL", 0.7); break;    // battery
+				case 70: setLook("PINS", 0.4); break;    // pill
+				case 100: setLook("MEGA", 0.7); break;   // item pedestal
+				case 300: setLook("PINV", 0.4); break;   // card
+				case 350: setLook("BON2", 0.8); break;   // trinket
+				default: setLook("BON1", 0.7); break;
+			}
+		}
+		else setLook("TNT1", 1.0);
+		if (kind == "p" || kind == "t") { A_SetRenderStyle(1.0, STYLE_Add); }
+		if (zoff != 0) SetOrigin((pos.x, pos.y, zoff), false);
+		// with the Isaac sprite pack loaded, the Doom stand-in must never flash up
+		let hh = IsaacHandler(EventHandler.Find("IsaacHandler"));
+		if (hh && hh.sprTableSize > 0 && kind != "o" && kind != "x") bINVISIBLE = true;
+	}
+
+	// Tech X: a glowing ring lying on the floor, radius in Doom units
+	void setRing(double r)
+	{
+		if (!bFLATSPRITE)
+		{
+			bFLATSPRITE = true;
+			isaacSprite = true;
+			picnum = TexMan.CheckForTexture("ISRGA0", TexMan.Type_Sprite);
+			A_SetRenderStyle(1.0, STYLE_Add);
+			bBRIGHT = true;
+		}
+		double sc = (2 * r) / 112.0;      // the ring art is 112 px across in a 128 px sprite
+		scale = (sc, sc);
+		bINVISIBLE = false;               // (the stand-in look hides mirrors until real art is set)
+		SetOrigin((pos.x, pos.y, baseZ + IsaacHandler.BEAM_Z_FLAT), false);   // the same plane as the Brimstone beam
+	}
+
+	void setIsaacAnim(String key, String anim, int fr, bool flip)
+	{
+		if (key.Length() == 0) return;
+		if (key != anmKey || anim != anmAnim)
+		{
+			anmKey = key; anmAnim = anim;
+			directional = 0;
+			anmTokens.Clear();
+			// Black Powder's pentagram lies over the ash trail and any creep it was drawn across
+			if (kind == "d" && key.IndexOf("pentagram") >= 0 && zoff < 1.3) { zoff = 1.4; SetOrigin((pos.x, pos.y, baseZ + zoff), false); }
+			// a bomb's scorch mark goes under everything else lying on the floor
+			if (kind == "d" && key.IndexOf("crater") >= 0 && zoff > 0.5) { zoff = 0.45 + (iid % 5) * 0.01; SetOrigin((pos.x, pos.y, baseZ + zoff), false); }
+			let h = IsaacHandler(EventHandler.Find("IsaacHandler"));
+			if (!h || !h.sprTable) return;
+			String val = h.sprTable.At(key .. "|" .. anim);
+			if (val.Length() == 0 && key.IndexOf("@") >= 0)
+			{
+				// door skin not converted (yet): use the plain door
+				val = h.sprTable.At(key.Left(key.IndexOf("@")) .. "|" .. anim);
+			}
+			if (val.Length() == 0)
+			{
+				// unknown animation: fall back to the Doom stand-in (hidden while the sprite pack is loaded)
+				if (isaacSprite) { isaacSprite = false; picnum.SetInvalid(); setupLook(); }
+				return;
+			}
+			val.Split(anmTokens, " ", TOK_SKIPEMPTY);
+		}
+		if (anmTokens.Size() == 0) return;
+		String tok = anmTokens[clamp(fr, 0, anmTokens.Size() - 1)];
+		if (tok == "-") return;   // invisible frame: keep the last one
+		if (!isaacSprite)
+		{
+			isaacSprite = true;
+			walkFrames = 1;
+			if (kind == "p" || kind == "t") A_SetRenderStyle(1.0, STYLE_Normal);
+		}
+		if (gtypeForScale() != 16)
+		{
+			double sc = CVar.GetCVar(kind == "g" ? 'isaac_gridscale' : 'isaac_scale', players[consoleplayer]).GetFloat();
+			if (sc <= 0) sc = 1.0;
+			// smashed-rock rubble: Isaac's small bits at the world scale, not blown up to fill the cell like a rock
+			if (gtypeForScale() == 99) { sc = CVar.GetCVar('isaac_scale', players[consoleplayer]).GetFloat(); if (sc <= 0) sc = 1.6; sc *= 0.9; }
+			// pits tile: each 26 px frame is exactly one cell of Isaac's art, so it must span the
+			// 64-unit cell exactly for the neighbour-shaped edges to meet (gaps otherwise)
+			if (gtypeForScale() == 7) sc = 64.0 / 26.0;
+			// rock / wood chunks lying on the floor: Isaac's 16 px bits at the true cell scale
+			// (40 Isaac units = 64 Doom units), not blown up like the upright sprites
+			if (kind == "d" && (ivariant == 4 || ivariant == 27)) sc = 64.0 / 40.0;
+			// Isaac's own per-entity sprite scale (shrinking fires, growing enemies, big/small champions)
+			if (spriteScale > 0 && kind != "g") sc *= spriteScale;
+			// fireplaces shrink as they burn down; if the game doesn't express that through the
+			// sprite scale, do it from their hit points (10 for a fresh fire)
+			if (kind == "n" && itype == 33 && spriteScale > 0.98 && maxhp > 0) sc *= clamp(0.45 + 0.55 * hp / maxhp, 0.45, 1.0);
+			scale = (sc, sc);
+			if (kind == "t" || kind == "p") orientShot();
+		}
+		// only switch to a frame whose texture the engine actually registered
+		TextureID tex = TexMan.CheckForTexture(tok .. "0", TexMan.Type_Sprite);
+		if (!tex.IsValid())
+		{
+			let h2 = IsaacHandler(EventHandler.Find("IsaacHandler"));
+			if (h2 && !h2.sprWarned) { h2.sprWarned = true; Console.Printf("IsaacDoom: sprite lump %s0 missing - Isaac sprites disabled", tok); }
+			if (isaacSprite) { isaacSprite = false; picnum.SetInvalid(); setupLook(); }
+			anmTokens.Clear();
+			return;
+		}
+		// draw the texture directly (picnum) instead of going through sprite frame tables
+		picnum = tex;
+		// the big bosses (Gurdy, Mom...) would poke through the ceiling at full scale: shrink
+		// them just enough to fit, and keep that factor so the frames don't pump in size
+		if (kind == "n" || kind == "o" || kind == "f" || kind == "s")
+		{
+			if (fitFactor <= 0) fitFactor = 1;
+			if (kind != "o")
+			{
+				Vector2 sz = TexMan.GetScaledSize(tex);
+				double hgt = sz.y * scale.y * fitFactor;
+				let hh = IsaacHandler(EventHandler.Find("IsaacHandler"));
+				double room = (hh ? hh.roomCeil() : IsaacHandler.CEIL) - 6;
+				if (hgt > room) fitFactor *= room / hgt;
+				if (overlay) overlay.fitFactor = fitFactor;
+			}
+			scale *= fitFactor;
+		}
+		if (kind != "K") bINVISIBLE = false;      // (the knife decides its own visibility)
+		bSPRITEFLIP = flip;
+		onFrameSet(tex);
+	}
+
+	double baseZ;   // floor height this thing stands on
+	bool onFire;    // burning status from Isaac: has a fire light attached
+
+	// Isaac pivots are often mid-object: rest the sprite's bottom edge on the floor
+	void standOnFloor(TextureID tex)
+	{
+		Vector2 sz = TexMan.GetScaledSize(tex);
+		Vector2 off = TexMan.GetScaledOffset(tex);
+		// negative when the pivot sits below the art (Isaac draws big bosses above their spot):
+		// then the origin goes under the floor so the art's bottom edge still rests on it
+		double lift = (sz.y - off.y) * scale.y;
+		// flying things (flies, hosts' spores, Mom's eye...) hover up around eye level
+		if (flying && kind == "n" && itype != 33 && itype != 17) lift += FLY_HOVER;   // (never props: fireplaces, shopkeepers)
+		SetOrigin((pos.x, pos.y, baseZ + lift), false);
+	}
+	const FLY_HOVER = 26;
+
+	virtual int gtypeForScale() { return 0; }
+
+	virtual void onFrameSet(TextureID tex)
+	{
+		if (hasOverlay)
+		{
+			// pickups: lifted onto the pedestal top; enemies with head overlays: the body rests
+			// on the floor by its art (its pivot may sit below the art, as with the big bosses)
+			// and the head layer shares the body's origin, since both are drawn from it in Isaac
+			if (kind == "k") SetOrigin((pos.x, pos.y, baseZ + 18 * scale.y), false);
+			else { standOnFloor(tex); if (overlay) overlay.SetOrigin((overlay.pos.x, overlay.pos.y, pos.z), false); }
+			return;
+		}
+		if (kind == "o" && ownerKind == "n")
+		{
+			// an enemy's head/overlay layer: its z is the body's (placeOverlay keeps it there)
+			return;
+		}
+		if (zoff == 0 && !bFLATSPRITE && !bWALLSPRITE) standOnFloor(tex);
+	}
+
+	void flashHit()
+	{
+		hitFlash = 4;
+		bBRIGHT = true;
+		if (overlay) { overlay.hitFlash = 4; overlay.bBRIGHT = true; }   // the head lights up with the body
+		for (int i = 0; i < 2; i++)
+		{
+			Actor b = Spawn("Blood", pos + (frandom(-6, 6), frandom(-6, 6), 20 * scale.y + 8));
+			if (b) b.vel = (frandom(-2, 2), frandom(-2, 2), frandom(1, 4));
+		}
+	}
+
+	static double shotHeight()
+	{
+		let cv = CVar.FindCVar('isaac_shotz');
+		return cv ? cv.GetFloat() : 28;
+	}
+
+	// shots and tears: a shadow on the floor and a fading trail, so their path reads in first person
+	void updateReadability()
+	{
+		bool wantShadow = false, wantTrail = false;
+		let cs = CVar.FindCVar('isaac_shadows');
+		if (cs && cs.GetBool()) wantShadow = (kind == "p" || kind == "t" || kind == "K" || kind == "n" || kind == "f" || kind == "b");
+		let ct = CVar.FindCVar('isaac_trails');  if (ct && ct.GetBool()) wantTrail = (kind == "p");
+		if (kind == "p")
+		{
+			// Isaac's arc when it reports one (shots lob and land), the fixed height otherwise
+			zoff = isaacHeight < 500 ? max(2, -isaacHeight * ISAAC_UNIT) : shotHeight();
+			if (abs(pos.z - zoff) > 0.5) SetOrigin((pos.x, pos.y, zoff), true);
+		}
+		if (wantShadow)
+		{
+			if (!shadow) shadow = Spawn("IsaacShadow", (pos.x, pos.y, floorz + 1));
+			if (shadow)
+			{
+				// disc diameter ~ 3/4 of the sprite's drawn width (Isaac's shadows sit well inside the
+				// art); the collision circle is the fallback when there is no Isaac frame. Art is 60 px across.
+				double diam;
+				if (picnum.IsValid()) { Vector2 tsz = TexMan.GetScaledSize(picnum); diam = tsz.x * scale.x * 0.75; }
+				else diam = isize * 2 * 1.6 * 0.85;
+				double sc = clamp(diam / 60.0, 0.12, 3.5);
+				shadow.scale = (sc, sc);
+				// the disc lies behind the sprite's plane (away from the camera by its own radius):
+				// a translucent floor sprite is depth-tested against the opaque billboard, so any part
+				// of it nearer the camera than that plane would paint over the enemy's feet. Behind the
+				// plane it reads as a shadow thrown away from the viewer.
+				let cam = players[consoleplayer].mo;
+				Vector2 back = cam ? (pos.xy - cam.pos.xy) : (1, 0);
+				if (back.Length() < 1) back = (1, 0);
+				back = back.Unit() * (sc * 30 * 0.95);
+				shadow.SetOrigin((pos.x + back.x, pos.y + back.y, floorz + 1), true);
+				shadow.bINVISIBLE = bINVISIBLE;
+			}
+		}
+		else if (shadow) { shadow.Destroy(); shadow = null; }
+		if (wantTrail && !bINVISIBLE && level.maptime - trailTic >= 2 && vel2.Length() > 0.3)
+		{
+			trailTic = level.maptime;
+			let g = IsaacTrail(Spawn("IsaacTrail", pos));
+			if (g)
+			{
+				g.sprite = sprite; g.frame = frame; g.picnum = picnum;
+				g.scale = scale * 0.8; g.Translation = Translation;
+				g.A_SetRenderStyle(0.45, STYLE_Add);
+			}
+		}
+	}
+
+	override void Tick()
+	{
+		Super.Tick();
+		if (hitFlash > 0 && --hitFlash == 0) bBRIGHT = false;
+		if (isFrozen()) return;
+		if (vel2.Length() > 0.01)
+		{
+			// tears and shots keep falling between Isaac's updates, at Isaac's own falling speed
+			double dz = (kind == "t" || kind == "p") && isaacHeight < 500 ? -isaacFall * 1.6 * 30.0 / 35.0 : 0;
+			double nz = (kind == "t" || kind == "p") ? max(2, pos.z + dz) : pos.z;   // (a boss's origin may sit below the floor)
+			SetOrigin((pos.x + vel2.x, pos.y + vel2.y, nz), true);
+			if (overlay) placeOverlay(true);   // the head rides along, always its hair in front of the body
+			if (tint) placeTint();      // the colour wash moves in lockstep, never a tic behind
+			if (kind != "d" && directional != 1) angle = atan2(vel2.y, vel2.x);
+			if (walkFrames > 1) frame = (level.maptime / 6) % walkFrames;
+		}
+		else if (walkFrames > 1 && kind != "n") frame = (level.maptime / 6) % walkFrames;
+		if (kind == "p" || kind == "t" || kind == "K" || kind == "n" || kind == "f" || kind == "b") updateReadability();
+		if ((kind == "t" || kind == "p") && isaacSprite) orientShot();
+		if (kind == "f" && isaacSprite) orientFinger();
+		if (kind == "f") updateCord();
+	}
+
+	// Isaac draws nails, bones, needles... pointing along their flight. Instead of a billboard
+	// facing the camera (which makes a nail flying away look like it slides sideways), these
+	// are drawn as a standing plane that contains the flight line: seen from the side it is
+	// the full nail pointing where it goes, seen from behind it is end-on, like a real nail.
+	// Drawn lying flat, parallel to the floor, at the tear's height, turned so the art's point
+	// leads: a flat sprite's texture "up" runs along the actor's angle, and Isaac's nail art
+	// points to the texture's right, which is 90 degrees clockwise from that.
+	const NAIL_ROT = -90;     // (90 sent them head first)
+	void orientShot()
+	{
+		if (directional == 0)
+		{
+			String k = anmKey;
+			directional = (k.IndexOf("nail") >= 0 || k.IndexOf("needle") >= 0 || k.IndexOf("bone") >= 0
+				|| k.IndexOf("scythe") >= 0 || k.IndexOf("razor") >= 0 || k.IndexOf("cupid") >= 0
+				|| k.IndexOf("chaos card") >= 0 || k.IndexOf("belial") >= 0 || k.IndexOf("spear") >= 0) ? 1 : 2;
+		}
+		if (directional != 1) return;
+		if (!bFLATSPRITE) { bFLATSPRITE = true; bWALLSPRITE = false; bSPRITEFLIP = true; bROLLSPRITE = true; bROLLCENTER = true; }
+		if (vel2.Length() < 0.05) return;
+		// the actor's forward (angle) runs along the flight; the art is turned in-plane with roll so
+		// its point lies along that forward, and pitch then tilts the nose down (plus the firing pitch)
+		angle = atan2(vel2.y, vel2.x);
+		roll = NAIL_ROLL;
+		pitch = 0;               // dead flat, parallel to the floor, exactly as Isaac shows it from above
+		// a flat nail seen from behind is a sliver: a small grey bead on its tail gives it a body
+		if (!tailDot) tailDot = Spawn("IsaacTailDot", pos);
+		if (tailDot)
+		{
+			Vector2 back = vel2.Unit() * (-12 * scale.y);
+			tailDot.SetOrigin((pos.x + back.x, pos.y + back.y, pos.z), true);
+			tailDot.scale = (0.45 * scale.y, 0.45 * scale.y);
+			tailDot.bINVISIBLE = bINVISIBLE;
+		}
+	}
+	const NAIL_ROLL = -90;    // in-plane turn that lays the art's point along the flight (90 = head first when flat)
+	const FINGER_ROLL = 180;  // the finger art points against the actor's forward: half a turn lays it pointing away
+	const FINGER_Z = 18;      // a little lower than the tears so more of the flat art shows
+
+	// an umbilical cord from Isaac to a familiar that has one (Little Gemini, Gello): a string of
+	// beads along a sagging curve from the player's middle to the familiar
+	const CORD_BEADS = 14;
+	void updateCord()
+	{
+		bool want = status == 100 && !bINVISIBLE;
+		if (!want)
+		{
+			for (int i = 0; i < cord.Size(); i++) if (cord[i]) cord[i].Destroy();
+			cord.Clear();
+			return;
+		}
+		let pmo = players[consoleplayer].mo;
+		if (!pmo) return;
+		if (cord.Size() < CORD_BEADS)
+		{
+			for (int i = cord.Size(); i < CORD_BEADS; i++)
+			{
+				Actor b = Spawn("IsaacCordBead", pos);
+				if (b) { b.scale = (0.9, 0.9); }
+				cord.Push(b);
+			}
+		}
+		Vector3 a = (pmo.pos.x, pmo.pos.y, 22);          // Isaac's belly
+		Vector3 c = (pos.x, pos.y, pos.z + 6);            // the familiar's underside
+		for (int i = 0; i < cord.Size(); i++)
+		{
+			if (!cord[i]) continue;
+			double t = (i + 1.0) / (CORD_BEADS + 1.0);
+			Vector3 p = a + (c - a) * t;
+			p.z -= sin(t * 180) * 10;                       // sag in the middle
+			if (p.z < 3) p.z = 3;
+			cord[i].SetOrigin(p, true);
+			cord[i].bINVISIBLE = bINVISIBLE;
+		}
+	}
+
+	// Finger!: lies flat like Mom's knife and always points the way you look, at Isaac's own
+	// reach from the player (Isaac keeps it on the last aim between shots; the look is what counts here)
+	void orientFinger()
+	{
+		if (directional == 0)
+		{
+			String k = anmKey;
+			directional = k.IndexOf("finger") >= 0 ? 3 : 2;
+		}
+		if (directional != 3) return;
+		let pmo = players[consoleplayer].mo;
+		if (!pmo) return;
+		if (!bFLATSPRITE) { bFLATSPRITE = true; bWALLSPRITE = false; bSPRITEFLIP = true; bROLLSPRITE = true; bROLLCENTER = true; }
+		let h = IsaacHandler(EventHandler.Find("IsaacHandler"));
+		Vector2 ip = h ? h.isaacPlayerPos : pmo.pos.xy;
+		double reach = (pos.xy - ip).Length();
+		if (reach < 24) reach = 24;
+		Vector2 fwd = (cos(pmo.angle), sin(pmo.angle));
+		SetOrigin((pmo.pos.x + fwd.x * reach, pmo.pos.y + fwd.y * reach, FINGER_Z), true);
+		angle = pmo.angle;
+		roll = FINGER_ROLL;
+		pitch = 0;
+	}
+
+	// the champion / hit-flash wash sits a hair in front of the sprite, toward the camera
+	void placeTint()
+	{
+		if (!tint) return;
+		let cam = players[consoleplayer].mo;
+		Vector2 toward = cam ? cam.pos.xy - pos.xy : (1, 0);
+		if (toward.Length() < 1) toward = (1, 0);
+		toward = toward.Unit() * 1.5;
+		tint.SetOrigin((pos.x + toward.x, pos.y + toward.y, pos.z), true);
+		// mirror the sprite exactly: frame, size, flip and orientation (flat decals, turned shots)
+		tint.picnum = picnum; tint.scale = scale; tint.bSPRITEFLIP = bSPRITEFLIP; tint.bFLATSPRITE = bFLATSPRITE;
+		tint.bROLLSPRITE = bROLLSPRITE; tint.bROLLCENTER = bROLLCENTER;
+		tint.angle = angle; tint.roll = roll; tint.pitch = pitch;
+		tint.bINVISIBLE = bINVISIBLE;
+	}
+
+	// a colour wash (champion tint / red hit flash) as a stencil copy of this sprite
+	void applyTint(Color col, double alpha)
+	{
+		if (!tint)
+		{
+			tint = IsaacMirror(Actor.Spawn("IsaacMirror", pos));
+			if (!tint) return;
+			tint.kind = "x"; tint.isaacSprite = true;
+			tint.A_SetRenderStyle(0.5, STYLE_Stencil);
+		}
+		tint.picnum = picnum; tint.scale = scale; tint.bSPRITEFLIP = bSPRITEFLIP; tint.bFLATSPRITE = bFLATSPRITE;
+		tint.SetShade(col);
+		tint.alpha = alpha;
+		placeTint();
+	}
+
+	void dropTint()
+	{
+		if (tint) { tint.Destroy(); tint = null; }
+		if (overlay && overlay.tint) overlay.dropTint();
+	}
+
+	// the overlay layer (an enemy's head, a pedestal's base) shares this sprite's spot: an
+	// enemy's head is drawn on top in Isaac, so it sits a step toward the camera; a pedestal
+	// sits under its item, so a step away. Done every tic so nothing can undo it, and the
+	// overlay's own wash follows.
+	void placeOverlay(bool interp)
+	{
+		if (!overlay) return;
+		let cam = players[consoleplayer].mo;
+		Vector2 toward = cam ? cam.pos.xy - pos.xy : (1, 0);
+		if (toward.Length() < 1) toward = (1, 0);
+		toward = toward.Unit() * (kind == "n" ? 8 : -6);
+		overlay.SetOrigin((pos.x + toward.x, pos.y + toward.y, kind == "n" ? pos.z : overlay.pos.z), interp);
+		if (overlay.tint) overlay.placeTint();
+	}
+
+	override void OnDestroy()
+	{
+		for (int i = 0; i < cord.Size(); i++) if (cord[i]) cord[i].Destroy();
+		if (overlay) overlay.Destroy();
+		if (tint) tint.Destroy();
+		if (shadow) shadow.Destroy();
+		if (tailDot) tailDot.Destroy();
+		Super.OnDestroy();
+	}
+
+	// called when Isaac stops reporting this entity: it died, burst, or was picked up
+	void vanish()
+	{
+		if (kind == "n" && !(maxhp > 0 && hp <= 0))     // died on screen: its death animation already played, no extra gibs
+		{
+			for (int i = 0; i < 3; i++)
+			{
+				Actor b = Spawn("Blood", pos + (frandom(-8, 8), frandom(-8, 8), 16));
+				if (b) b.vel = (frandom(-2, 2), frandom(-2, 2), frandom(2, 5));
+			}
+			{ let hs = IsaacHandler(EventHandler.Find("IsaacHandler")); if (!hs || !hs.haveIsaacSfx) A_StartSound("misc/gibbed", CHAN_AUTO, 0, 0.6); }
+		}
+		else if (kind == "t")
+		{
+			let hh = IsaacHandler(EventHandler.Find("IsaacHandler"));
+			if (!hh || hh.sprTableSize == 0) Spawn("IsaacTearPop", pos);   // Isaac's own poof effect is mirrored otherwise
+			// did it end on an enemy? splat the nearest one within reach
+			let h = IsaacHandler(EventHandler.Find("IsaacHandler"));
+			if (h)
+			{
+				IsaacMirror best = null; double bestD = 48;
+				for (int i = 0; i < h.mirrors.Size(); i++)
+				{
+					let o = h.mirrors[i];
+					if (!o || o == self || o.kind != "n") continue;
+					double d = (o.pos.xy - pos.xy).Length() - 16 * o.scale.x;
+					if (d < bestD) { bestD = d; best = o; }
+				}
+				if (best) best.flashHit();
+			}
+		}
+		else if (kind == "p")
+		{
+			let hh = IsaacHandler(EventHandler.Find("IsaacHandler"));
+			if (!hh || hh.sprTableSize == 0) Spawn("IsaacShotPop", pos);
+		}
+		else if (kind == "k") { let hs = IsaacHandler(EventHandler.Find("IsaacHandler")); if (!hs || !hs.haveIsaacSfx) A_StartSound("misc/i_pkup", CHAN_AUTO, 0, 0.7); }
+		Destroy();
+	}
+}
+
+// solid mirror for slot machines / beggars: you bump into them like in Isaac
+class IsaacMirrorSolid : IsaacMirror
+{
+	Default
+	{
+		-NOBLOCKMAP
+		-NOINTERACTION
+		+SOLID
+		+DONTTHRUST
+		Radius 12;
+		Height 48;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// One-shot visual effects
+// ---------------------------------------------------------------------------
+class IsaacTearPop : Actor
+{
+	Default { +NOGRAVITY +NOBLOCKMAP +NOINTERACTION RenderStyle "Add"; Scale 0.5; }
+	States
+	{
+	Spawn:
+		PLSE ABCDE 3 BRIGHT;
+		Stop;
+	}
+}
+
+class IsaacShotPop : Actor
+{
+	Default { +NOGRAVITY +NOBLOCKMAP +NOINTERACTION RenderStyle "Add"; Scale 0.6; }
+	States
+	{
+	Spawn:
+		BAL1 CDE 4 BRIGHT;
+		Stop;
+	}
+}
+
+class IsaacExplosion : Actor
+{
+	Default { +NOGRAVITY +NOBLOCKMAP +NOINTERACTION RenderStyle "Add"; Scale 1.6; }
+	States
+	{
+	Spawn:
+		MISL B 6 BRIGHT { let hs = IsaacHandler(EventHandler.Find("IsaacHandler")); if (!hs || !hs.haveIsaacSfx) A_StartSound("weapons/rocklx", CHAN_AUTO); A_AttachLightDef("boom", "ISAACBOOM"); }
+		MISL C 5 BRIGHT A_AttachLightDef("boom", "ISAACBOOM2");
+		MISL D 4 BRIGHT A_RemoveLight("boom");
+		Stop;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Invisible emitter for a positional Isaac sound; gone after the longest clip
+// ---------------------------------------------------------------------------
+// soft dark blob lying on the floor under a shot: its floor position gives the depth cue
+// a sprite flying straight at the camera lacks
+class IsaacShadow : Actor
+{
+	Default
+	{
+		+NOGRAVITY +NOBLOCKMAP +NOINTERACTION +NOTELEPORT +FLATSPRITE +DONTSPLASH
+		RenderStyle "Translucent";
+		Alpha 0.55;
+		Radius 4; Height 2;
+	}
+	States
+	{
+	Spawn:
+		ISSH A -1;
+		Stop;
+	}
+}
+
+// fading after-image of a shot, dropped every couple of tics: draws its path
+class IsaacTrail : Actor
+{
+	Default
+	{
+		+NOGRAVITY +NOBLOCKMAP +NOINTERACTION +NOTELEPORT +DONTSPLASH +BRIGHT
+		Radius 4; Height 4;
+	}
+	States
+	{
+	Spawn:
+		TNT1 A -1;
+		Stop;
+	}
+	override void Tick()
+	{
+		Super.Tick();
+		alpha -= 0.06;
+		scale *= 0.93;
+		if (alpha <= 0.02) Destroy();
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Laser beams: a polyline of glowing ribbon segments. Each segment is a pair
+// of sprites - one standing (wall sprite) and one lying flat - crossed through
+// the beam's axis, so it reads as a solid tube from every angle.
+// ---------------------------------------------------------------------------
+class IsaacBeamSeg : Actor
+{
+	Default
+	{
+		+NOGRAVITY +NOBLOCKMAP +NOINTERACTION +NOTELEPORT +DONTSPLASH +FLATSPRITE +BRIGHT
+		RenderStyle "Add";
+		Alpha 1.0;
+		Radius 8; Height 16;
+	}
+	States { Spawn: TNT1 A -1; Stop; }     // drawn through picnum, like the controls decal on the floor
+	String tintCode;
+}
+
+class IsaacBeam : Actor
+{
+	int bid, variant, seenSeq;
+	bool dbgShown;
+	bool pitchSet; double pitch;   // vertical aim at firing (Doom pitch: positive = down)
+
+	// beam height at a distance along its path: the flat pieces step up or down with the pitch
+	double zAt(double z0, double dist)
+	{
+		if (!pitchSet || abs(pitch) < 0.5) return z0;
+		return clamp(z0 - tan(pitch) * dist, 1.0, 116.0);
+	}
+	Array<IsaacBeamSeg> segs;      // one flat sprite per segment
+	Default { +NOGRAVITY +NOBLOCKMAP +NOINTERACTION +NOTELEPORT }
+	States { Spawn: TNT1 A -1; Stop; }
+
+	// look per LaserVariant: thickness (Doom units) and tint code (see TRNSLATE IST codes)
+	double baseThick()
+	{
+		switch (variant)
+		{
+			case 1:  return 40;   // THICK_RED - Brimstone
+			case 2:  return 10;   // THIN_RED - Technology
+			case 3:  return 52;   // SHOOP
+			case 4:  return 40;   // PRIDE
+			case 5:  return 40;   // LIGHT_BEAM - Crack the Sky
+			case 6:  return 96;   // GIANT_RED - Mega Blast
+			case 7:  return 12;   // TRACTOR_BEAM
+			case 9:  return 28;   // BRIM_TECH
+			case 10: return 8;    // ELECTRIC - Jacob's Ladder
+			case 11: return 60;   // THICKER_RED
+			case 12: return 40;   // THICK_BROWN
+			case 13: return 48;   // BEAST
+			case 14: return 44;   // THICKER_BRIM_TECH
+			case 15: return 96;   // GIANT_BRIM_TECH
+			default: return 30;
+		}
+	}
+	// pre-tinted ribbon textures (gfx/ISB?A0.png): no runtime translation on the flat sprite
+	String ribbonTex()
+	{
+		switch (variant)
+		{
+			case 3:  return "ISBCA0";   // shoop: pale blue-white
+			case 5:  return "ISBWA0";   // light beam: white
+			case 7:  return "ISBBA0";   // tractor: blue
+			case 10: return "ISBCA0";   // electric
+			case 12: return "ISBOA0";   // brown-ish
+			case 13: return "ISBWA0";   // beast: white
+			default: return "ISBRA0";   // red
+		}
+	}
+
+	void update(Array<double> pts, double sc, double z)
+	{
+		placeLight(pts, z);
+		int n = pts.Size() / 2;
+		double thick = baseThick() * (sc > 0 ? sc : 1.0);
+		TextureID rtex = TexMan.CheckForTexture(ribbonTex(), TexMan.Type_Sprite);
+		if (!rtex.IsValid()) rtex = TexMan.CheckForTexture("ISBMA0", TexMan.Type_Sprite);
+		if (!dbgShown) { dbgShown = true; Console.Printf("IsaacDoom: beam %d variant %d: %d points, first (%.0f,%.0f) last (%.0f,%.0f), ribbon tex %s, player (%.0f,%.0f)",
+			bid, variant, n, pts[0], pts[1], pts[n * 2 - 2], pts[n * 2 - 1], rtex.IsValid() ? "ok" : "MISSING",
+			players[consoleplayer].mo ? players[consoleplayer].mo.pos.x : 0, players[consoleplayer].mo ? players[consoleplayer].mo.pos.y : 0); }
+		// one flat sprite per ~64 units: a single sprite spanning a whole beam gets culled by the
+		// renderer whenever its centre leaves the view, so long runs are cut into short pieces
+		double PIECE = 64.0;
+		int want = 0;
+		for (int i = 0; i + 1 < n; i++)
+		{
+			double dx = pts[i * 2 + 2] - pts[i * 2], dy = pts[i * 2 + 3] - pts[i * 2 + 1];
+			want += max(1, int(ceil(sqrt(dx * dx + dy * dy) / PIECE)));
+		}
+		while (segs.Size() < want)
+		{
+			let sg = IsaacBeamSeg(Spawn("IsaacBeamSeg", pos));
+			if (!sg) break;
+			sg.bFLATSPRITE = true;
+			segs.Push(sg);
+		}
+		while (segs.Size() > want) { let sg = segs[segs.Size() - 1]; if (sg) sg.Destroy(); segs.Pop(); }
+		int t = 0;
+		double along = 0;
+		for (int i = 0; i + 1 < n; i++)
+		{
+			double x0 = pts[i * 2], y0 = pts[i * 2 + 1], x1 = pts[i * 2 + 2], y1 = pts[i * 2 + 3];
+			double dx = x1 - x0, dy = y1 - y0;
+			double len = sqrt(dx * dx + dy * dy);
+			if (len < 0.5) len = 0.5;
+			double ang = atan2(dy, dx);
+			int pieces = max(1, int(ceil(len / PIECE)));
+			double step = len / pieces;
+			for (int k = 0; k < pieces; k++)
+			{
+				let sg = segs[t++];
+				if (!sg) continue;
+				double jz = 0, jx = 0, jy = 0;
+				if (variant == 10) { jz = frandom(-4, 4); jx = frandom(-3, 3); jy = frandom(-3, 3); }   // electric arcs jitter
+				double f0 = (k + 0.5) / pieces;
+				sg.picnum = rtex;
+				sg.bFLATSPRITE = true; sg.bWALLSPRITE = false;
+				sg.A_SetRenderStyle(1.0, STYLE_Add);
+				sg.bBRIGHT = true;
+				sg.SetOrigin((x0 + dx * f0 + jx, y0 + dy * f0 + jy, zAt(z, along + step * (k + 0.5)) + jz), true);
+				sg.angle = ang + 90;                                     // ribbon runs along the piece
+				sg.scale = ((step + thick * 0.3) / 64.0, thick / 24.0);  // 64 px long, 24 px core band
+			}
+			along += len;
+		}
+	}
+
+	// Isaac's own beam art, lying flat along the path: the body frame (aw x ah px, beam along its
+	// height) is laid end to end in tiles so it never stretches, animated at Isaac's 30 fps
+	void placeLight(Array<double> pts, double z)
+	{
+		int n = pts.Size() / 2;
+		if (n < 1) return;
+		int m = n / 2;
+		SetOrigin((pts[m * 2], pts[m * 2 + 1], z), true);
+		if (!lit) { lit = true; A_AttachLightDef("glow", "ISAACLASER"); }
+	}
+	bool lit;
+
+	void updateFlat(Array<double> pts, double sc, double z, String art, int frames, double aw, double ah)
+	{
+		placeLight(pts, z);
+		int n = pts.Size() / 2;
+		double tileLen = ah * ISAAC_SCALE;                 // one body frame in Doom units (~100: short enough not to be culled)
+		double wScale = ISAAC_SCALE * (sc > 0 ? sc : 1.0);
+		int fr = frames > 0 ? int(level.maptime * 30.0 / 35.0 / 2) % frames : 0;   // Isaac shows each frame ~2 game frames
+		TextureID tex = TexMan.CheckForTexture(String.Format("%s%c0", art, 65 + fr), TexMan.Type_Sprite);
+		if (!tex.IsValid()) tex = TexMan.CheckForTexture(art .. "A0", TexMan.Type_Sprite);
+		if (!dbgShown) { dbgShown = true; Console.Printf("IsaacDoom: beam %d variant %d (art %s, %d frames): %d points, first (%.0f,%.0f) last (%.0f,%.0f), tex %s, player (%.0f,%.0f)",
+			bid, variant, art, frames, n, pts[0], pts[1], pts[n * 2 - 2], pts[n * 2 - 1], tex.IsValid() ? "ok" : "MISSING",
+			players[consoleplayer].mo ? players[consoleplayer].mo.pos.x : 0, players[consoleplayer].mo ? players[consoleplayer].mo.pos.y : 0); }
+		// count the tiles we need
+		int want = 0;
+		for (int i = 0; i + 1 < n; i++)
+		{
+			double dx = pts[i * 2 + 2] - pts[i * 2], dy = pts[i * 2 + 3] - pts[i * 2 + 1];
+			want += max(1, int(ceil(sqrt(dx * dx + dy * dy) / tileLen)));
+		}
+		while (segs.Size() < want)
+		{
+			let sg = IsaacBeamSeg(Spawn("IsaacBeamSeg", pos));
+			if (!sg) break;
+			segs.Push(sg);
+		}
+		while (segs.Size() > want) { let sg = segs[segs.Size() - 1]; if (sg) sg.Destroy(); segs.Pop(); }
+		int t = 0;
+		double along = 0;
+		for (int i = 0; i + 1 < n; i++)
+		{
+			double x0 = pts[i * 2], y0 = pts[i * 2 + 1], x1 = pts[i * 2 + 2], y1 = pts[i * 2 + 3];
+			double dx = x1 - x0, dy = y1 - y0;
+			double len = sqrt(dx * dx + dy * dy);
+			if (len < 0.5) len = 0.5;
+			double ang = atan2(dy, dx);
+			int tiles = max(1, int(ceil(len / tileLen)));
+			double step = len / tiles;
+			for (int k = 0; k < tiles; k++)
+			{
+				let sg = segs[t++];
+				if (!sg) continue;
+				double f0 = (k + 0.5) / tiles;
+				int style = CVar.GetCVar('isaac_beamstyle', players[consoleplayer]).GetInt();
+				sg.bWALLSPRITE = false; sg.bFLATSPRITE = style != 2;
+				sg.picnum = tex;
+				sg.A_SetRenderStyle(1.0, STYLE_Add);
+				sg.bBRIGHT = true;
+				sg.SetOrigin((x0 + dx * f0, y0 + dy * f0, zAt(z, along + step * (k + 0.5))), false);
+				if (!dbgPieces) Console.Printf("  piece %d at (%.0f,%.0f,%.0f) angle %.0f scale (%.2f,%.2f) flat=%d tex=%d", t, sg.pos.x, sg.pos.y, sg.pos.z, sg.angle, wScale, (step + 1) / ah, sg.bFLATSPRITE, sg.picnum.IsValid());
+				sg.angle = ang + BEAM_FLAT_ROT;               // the art's up axis runs along the beam
+				sg.scale = (wScale, (step + 1) / ah);         // tile length exactly one step (+1 to hide seams)
+			}
+			along += len;
+		}
+		dbgPieces = true;
+	}
+	bool dbgPieces;
+	const ISAAC_SCALE = 1.6;
+	const BEAM_FLAT_ROT = 0;      // flip to 180 if the art's "up" comes out pointing back at the player
+
+	override void OnDestroy()
+	{
+		for (int i = 0; i < segs.Size(); i++) if (segs[i]) segs[i].Destroy();
+		Super.OnDestroy();
+	}
+}
+
+// the grey bead on the tail of a flat nail / needle / bone shot
+class IsaacCordBead : Actor
+{
+	Default { +NOGRAVITY +NOBLOCKMAP +NOINTERACTION +NOTELEPORT +DONTSPLASH  Radius 2; Height 2; }
+	States { Spawn: ISCD A -1; Stop; }
+}
+
+class IsaacTailDot : Actor
+{
+	Default { +NOGRAVITY +NOBLOCKMAP +NOINTERACTION +NOTELEPORT +DONTSPLASH  Radius 2; Height 2; }
+	States { Spawn: ISNL A -1; Stop; }
+}
+
+class IsaacSoundSpot : Actor
+{
+	Default { +NOGRAVITY +NOBLOCKMAP +NOINTERACTION }
+	States { Spawn: TNT1 A 350; Stop; }
+}
+
+// ---------------------------------------------------------------------------
+// Flat decal lying on the floor (the starting-room controls tutorial)
+// ---------------------------------------------------------------------------
+class IsaacFloorDecal : Actor
+{
+	Default { +NOGRAVITY +NOBLOCKMAP +NOINTERACTION +FLATSPRITE +DONTSPLASH RenderStyle "Normal"; Alpha 1.0; }
+	States { Spawn: TNT1 A -1; Stop; }
+}
+
+// ---------------------------------------------------------------------------
+// Solid props standing in for Isaac grid obstacles. Purely blocking; Isaac
+// decides when a rock is actually gone (the cell then reverts to floor).
+// ---------------------------------------------------------------------------
+// low-poly rock (half a d10, see build_pk3.py) skinned with the stage's rock art; solid like Isaac's rocks
+class IsaacRockModel : Actor
+{
+	Default
+	{
+		Radius 28;
+		Height 72;
+		+SOLID +NOGRAVITY +DONTTHRUST +NOTAUTOAIMED +NOBLOOD +NOBLOCKMONST
+	}
+	States
+	{
+	Spawn:
+		ROCK A -1;
+		Stop;
+	}
+
+	// a rock spawned while its cell was still a wall (narrow rooms, rooms mid-rebuild) sits at the
+	// wall's height, and being weightless it stays up there when the floor drops: follow the floor down
+	override void Tick()
+	{
+		Super.Tick();
+		if (pos.z > floorz + 0.1) SetOrigin((pos.x, pos.y, floorz), false);
+	}
+}
+
+#include "zscript_rocks.txt"
+
+class IsaacRockBarrel : Actor
+{
+	Default
+	{
+		Radius 30;
+		Height 42;
+		+SOLID
+		+NOBLOOD
+		+DONTTHRUST
+		+NOTAUTOAIMED
+	}
+	States
+	{
+	Spawn:
+		BAR1 AB 6;
+		Loop;
+	}
+}
+
+// invisible wall filling a pit cell: Isaac won't let you walk over a pit either
+// Isaac tests the player's centre against a pit cell (its hitbox is tiny next to a cell),
+// so you can overhang a pit and squeeze diagonally between two of them. A full-cell box
+// here would seal every diagonal gap in a checkerboard pit room, so the blocker is
+// narrow: with the player's 16-unit radius the centre stops right at the cell edge.
+class IsaacPitBlock : Actor
+{
+	Default { Radius 14; Height 256; +SOLID +NOGRAVITY +DONTTHRUST +NOTAUTOAIMED }
+	States { Spawn: TNT1 A -1; Stop; }
+}
+
+class IsaacPoopBarrel : IsaacRockBarrel
+{
+	Default
+	{
+		Radius 14;
+		Height 26;
+		Scale 0.6;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The player's only weapon: fire = tears, altfire = bomb. It does no damage in
+// Doom; it just flags the handler, which tells Isaac.
+// ---------------------------------------------------------------------------
+class IsaacTearGun : Weapon
+{
+	Default
+	{
+		Weapon.SlotNumber 1;
+		Weapon.SelectionOrder 1;
+		Weapon.AmmoUse 0;
+		Weapon.AmmoGive 0;
+		+WEAPON.NOALERT
+		+WEAPON.NOAUTOFIRE
+		Inventory.PickupMessage "";
+	}
+
+	action void A_IsaacFire()
+	{
+		let h = IsaacHandler(EventHandler.Find("IsaacHandler"));
+		if (h) h.fireTics = 3;
+	}
+
+	action void A_IsaacBomb()
+	{
+		let h = IsaacHandler(EventHandler.Find("IsaacHandler"));
+		if (h) h.bombTics = 3;
+	}
+
+	States
+	{
+	Ready:
+		PISG A 1 A_WeaponReady;
+		Loop;
+	Deselect:
+		PISG A 1 A_Lower;
+		Loop;
+	Select:
+		PISG A 1 A_Raise;
+		Loop;
+	Fire:
+		PISG B 2 A_IsaacFire;
+		PISG A 2;
+		PISG A 0 A_ReFire;
+		Goto Ready;
+	AltFire:
+		PISG B 4 A_IsaacBomb;
+		PISG A 12;
+		Goto Ready;
+	Spawn:
+		TNT1 A -1;
+		Stop;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Isaac art for grid entities: rocks/poop/props stand up, pits/trapdoors/webs
+// lie flat on the floor, doors are vertical planes across the doorway.
+// ---------------------------------------------------------------------------
+class IsaacGridSprite : IsaacMirror
+{
+	int gtype;
+	bool rubble;      // the remains of a smashed rock: drawn flat at world scale
+
+	Default
+	{
+		+NOGRAVITY
+		+NOBLOCKMAP
+		+NOINTERACTION
+		Radius 8;
+		Height 8;
+	}
+
+	// grid types the player must not walk through: rocks of all kinds, poop, TNT, statues, pillars, locks, fireplaces
+	clearscope static bool isSolidType(int t)
+	{
+		return t == 2 || t == 3 || t == 4 || t == 5 || t == 6 || t == 11 || t == 12 || t == 13 || t == 14
+			|| t == 21 || t == 22 || t == 24 || t == 25 || t == 26 || t == 27;
+	}
+
+	void configure(int t, int c, int r, int w, int h, int m)
+	{
+		gtype = t;
+		kind = "g";
+		bFLATSPRITE = false;
+		bWALLSPRITE = false;
+		double x = (c + m) * 64 + 32, y = -((r + m) * 64 + 32), z = 0;
+		if (t == 16)
+		{
+			// door: plane just in front of the wall face, facing into the room
+			// flush with the room-side face of the wall (1 unit in front so it doesn't z-fight)
+			if (r == 0)          { y -= 33; angle = 270; }
+			else if (r == h - 1) { y += 33; angle = 90; }
+			else if (c == 0)     { x += 33; angle = 0; }
+			else                 { x -= 33; angle = 180; }
+		}
+		// floor height where the sprite actually stands (for a closed door that's the room side, not the raised cell)
+		Sector sec = Level.PointInSector((x, y));
+		double fz = sec ? sec.floorplane.ZatPoint((x, y)) : 0;
+		if (t == 16 && fz > 64) fz = 0;
+		baseZ = fz;
+		switch (t)
+		{
+			case 7:  case 17: case 18: case 10: case 19: case 20:   // pit, trapdoor, stairs, web, gravity, plate
+			case 1:  // decoration: floor debris
+				bFLATSPRITE = true;
+				z = fz + 1;   // whatever height the cell's floor is at (pits and shafts are lowered)
+				break;
+			case 16:
+				bWALLSPRITE = true;
+				break;
+			case 18: // crawlspace ladder: lean it against whichever neighbouring cell is rock
+			{
+				let hh = IsaacHandler(EventHandler.Find("IsaacHandler"));
+				bWALLSPRITE = true;
+				bFLATSPRITE = false;
+				int up = hh ? hh.gridChar(hh.curGrid, w, h, c, r - 1) : 87;
+				int dn = hh ? hh.gridChar(hh.curGrid, w, h, c, r + 1) : 46;
+				int lf = hh ? hh.gridChar(hh.curGrid, w, h, c - 1, r) : 46;
+				if (up == 87 || up == 120)      { y += 30; angle = 270; }
+				else if (lf == 87 || lf == 120) { x -= 30; angle = 0; }
+				else if (dn == 87 || dn == 120) { y -= 30; angle = 90; }
+				else                            { x += 30; angle = 180; }
+				z = fz;
+				break;
+			}
+			default: break;
+		}
+		SetOrigin((x, y, z), false);
+	}
+
+	override int gtypeForScale() { return rubble ? 99 : gtype; }
+
+	override void setupLook()
+	{
+		// no Doom stand-in for grid art: stay invisible until an Isaac frame is found
+		setLook("TNT1", 1.0);
+	}
+
+	override void onFrameSet(TextureID tex)
+	{
+		if (gtype == 16)
+		{
+			// doors: stretch the (already keystone-corrected) art to exactly floor-to-ceiling,
+			// a little wider than the opening so the frame overlaps the wall around it
+			Vector2 sz = TexMan.GetScaledSize(tex);
+			if (sz.x > 0 && sz.y > 0)
+			{
+				// the sill at the bottom of the art is sunk below the floor so there's nothing to "step over";
+				// the top still lands exactly on the wall top
+				double sink = 10;
+				scale = (88.0 / sz.x, (128.0 + sink) / sz.y);
+				standOnFloor(tex);
+				SetOrigin((pos.x, pos.y, pos.z - sink), false);
+			}
+		}
+		else if (gtype == 18)
+		{
+			// ladder: stretch to the tunnel height so it reaches the ceiling
+			Vector2 sz = TexMan.GetScaledSize(tex);
+			if (sz.x > 0 && sz.y > 0) scale = (scale.x, 96.0 / sz.y);
+			standOnFloor(tex);
+		}
+		else if (!bFLATSPRITE) standOnFloor(tex);
+	}
+
+	override void Tick()
+	{
+		if (hitFlash > 0 && --hitFlash == 0) bBRIGHT = false;
+	}
+}
+
+// solid version for rocks / poop / statues: the sprite itself is the collision object
+class IsaacGridSolid : IsaacGridSprite
+{
+	Default
+	{
+		-NOBLOCKMAP
+		-NOINTERACTION
+		+SOLID
+		+DONTTHRUST
+		+NOTAUTOAIMED
+		Radius 30;
+		Height 40;
+	}
+
+	override void setupLook()
+	{
+		// no Isaac frame found: at least show a barrel so the blocker isn't invisible
+		setLook("BAR1", 1.0);
+	}
+
+
+}
+
+// ---------------------------------------------------------------------------
+// Menus: Isaac-flavoured main menu and a character select that starts a new
+// run in Isaac (through the bridge) as the chosen character.
+// ---------------------------------------------------------------------------
+class IsaacMainMenu : ListMenu
+{
+	// Close() only pops one menu; while any menu is still open the game is
+	// paused, so a net event sent from a submenu would never be processed.
+	static void closeAllMenus()
+	{
+		let m = Menu.GetCurrentMenu();
+		for (int guard = 0; m && guard < 8; guard++)
+		{
+			m.Close();
+			m = Menu.GetCurrentMenu();
+		}
+	}
+
+	static int saveSlot()
+	{
+		let cv = CVar.FindCVar('isaac_saveslot');
+		int v = cv ? cv.GetInt() : 1;
+		return clamp(v, 1, 3);
+	}
+
+	override void Drawer()
+	{
+		int sw = Screen.GetWidth(), sh = Screen.GetHeight();
+		TextureID bg = TexMan.CheckForTexture("IUVSBG", TexMan.Type_Any);
+		if (bg.IsValid())
+			Screen.DrawTexture(bg, false, 0, 0, DTA_DestWidth, sw, DTA_DestHeight, sh, DTA_Alpha, 0.85);
+		else
+			Screen.Dim(Color(255, 0, 0, 0), 0.8, 0, 0, sw, sh);
+		Super.Drawer();
+		// the save file item shows which of Isaac's three files is in use
+		for (int i = 0; i < mDesc.mItems.Size(); i++)
+		{
+			let item = ListMenuItemTextItem(mDesc.mItems[i]);
+			if (!item) continue;
+			Font f = mDesc.mFont ? mDesc.mFont : SmallFont;
+			if (item.mText == "Save File")
+			{
+				String t = String.Format("< %d >", saveSlot());
+				int x = mDesc.mXpos + f.StringWidth("Save File") + 12;
+				Screen.DrawText(f, Font.CR_UNTRANSLATED, x, item.GetY(), t, DTA_Clean, true);
+			}
+			else if (item.mText == "Seed")
+			{
+				let cv = CVar.FindCVar('isaac_seed');
+				String sd = cv ? cv.GetString() : "";
+				String t = sd.Length() >= 8 ? sd.Left(4) .. " " .. sd.Mid(4, 4) : "random";
+				int x = mDesc.mXpos + f.StringWidth("Seed") + 12;
+				Screen.DrawText(f, Font.CR_UNTRANSLATED, x, item.GetY(), t, DTA_Clean, true);
+			}
+		}
+	}
+
+	// the seed is typed into GZDoom's text-entry overlay; Enter hands the text back here
+	void editSeed(bool fromcontroller)
+	{
+		let cv = CVar.FindCVar('isaac_seed');
+		String cur = cv ? cv.GetString() : "";
+		let mInput = TextEnterMenu.OpenTextEnter(Menu.GetCurrentMenu(), Menu.OptionFont(), cur, 8, fromcontroller);
+		mInput.ActivateMenu();
+	}
+
+	override bool MenuEvent(int mkey, bool fromcontroller)
+	{
+		let item = mDesc.mSelectedItem >= 0 ? ListMenuItemTextItem(mDesc.mItems[mDesc.mSelectedItem]) : null;
+		if (item && item.mText == "Save File" && (mkey == MKEY_Enter || mkey == MKEY_Left || mkey == MKEY_Right))
+		{
+			int v = saveSlot() + (mkey == MKEY_Left ? -1 : 1);
+			if (v > 3) v = 1;
+			if (v < 1) v = 3;
+			let cv = CVar.FindCVar('isaac_saveslot');
+			if (cv) cv.SetInt(v);
+			MenuSound("menu/cursor");
+			return true;
+		}
+		if (mkey == MKEY_Input)
+		{
+			// text-entry finished: keep only letters and digits, Isaac seeds are 8 of them
+			let mInput = TextEnterMenu(Menu.GetCurrentMenu());
+			String t = mInput ? mInput.GetText() : "";
+			String sd = "";
+			for (int i = 0; i < t.Length(); i++)
+			{
+				int c = t.ByteAt(i);
+				if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90)) sd.AppendCharacter(c);
+				else if (c >= 97 && c <= 122) sd.AppendCharacter(c - 32);
+			}
+			let cv = CVar.FindCVar('isaac_seed');
+			if (cv) cv.SetString(sd.Length() >= 8 ? sd.Left(8) : "");
+			MenuSound("menu/choose");
+			return true;
+		}
+		if (item && item.mText == "Seed" && (mkey == MKEY_Enter || mkey == MKEY_Left || mkey == MKEY_Right))
+		{
+			if (mkey == MKEY_Enter) editSeed(fromcontroller);
+			else { let cv = CVar.FindCVar('isaac_seed'); if (cv) cv.SetString(""); MenuSound("menu/cursor"); }   // left/right: clear
+			return true;
+		}
+		if (mkey == MKEY_Enter && item)
+		{
+			if (item.mText == "Resume") { MenuSound("menu/choose"); Close(); return true; }
+			if (item.mText == "Continue") { MenuSound("menu/choose"); EventHandler.SendNetworkEvent("isaac_continue", saveSlot()); IsaacMainMenu.closeAllMenus(); return true; }
+		}
+		return Super.MenuEvent(mkey, fromcontroller);
+	}
+}
+
+// Isaac's challenges: left / right to browse, Enter to start (on the chosen save file)
+class IsaacChallengeMenu : ListMenu
+{
+	int sel;
+	static const String NAMES[] = { "Pitch Black", "High Brow", "Head Trauma", "Darkness Falls", "The Tank", "Solar System",
+		"Suicide King", "Cat Got Your Tongue", "Demo Man", "Cursed!", "Glass Cannon", "When Life Gives You Lemons", "Beans!",
+		"It's in the Cards", "Slow Roll", "Computer Savvy", "Waka Waka", "The Host", "The Family Man", "Purist", "XXXXXXXXL",
+		"SPEED!", "Blue Bomber", "PAY TO PLAY", "Have a Heart", "I RULE!", "BRAINS!", "PRIDE DAY!", "Onan's Streak",
+		"The Guardian", "Backasswards", "Aprils Fool", "Pokey Mans", "Ultra Hard", "Pong", "Scat Man", "Bloody Mary",
+		"Baptism by Fire", "Isaac's Awakening", "Seeing Double", "Pica Run", "Hot Potato", "Cantripped!", "Red Redemption",
+		"DELETE THIS" };
+
+	override bool MenuEvent(int mkey, bool fromcontroller)
+	{
+		int n = NAMES.Size();
+		if (mkey == MKEY_Left || mkey == MKEY_Up) { sel = (sel + n - 1) % n; MenuSound("menu/cursor"); return true; }
+		if (mkey == MKEY_Right || mkey == MKEY_Down) { sel = (sel + 1) % n; MenuSound("menu/cursor"); return true; }
+		if (mkey == MKEY_Enter)
+		{
+			MenuSound("menu/choose");
+			EventHandler.SendNetworkEvent("isaac_challenge", sel + 1, IsaacMainMenu.saveSlot());
+			IsaacMainMenu.closeAllMenus();
+			return true;
+		}
+		return Super.MenuEvent(mkey, fromcontroller);
+	}
+
+	override void Drawer()
+	{
+		int sw = Screen.GetWidth(), sh = Screen.GetHeight();
+		double u = sh / 270.0;
+		TextureID bg = TexMan.CheckForTexture("IUVSBG", TexMan.Type_Any);
+		if (bg.IsValid()) Screen.DrawTexture(bg, false, 0, 0, DTA_DestWidth, sw, DTA_DestHeight, sh, DTA_Alpha, 0.9);
+		else Screen.Dim(Color(255, 0, 0, 0), 0.85, 0, 0, sw, sh);
+		Font big = Font.GetFont("ISUPHEAV");
+		if (!big) big = BigFont;
+		Font small = Font.GetFont("ISMEAT12");
+		if (!small) small = SmallFont;
+		String t = String.Format("Challenge %d", sel + 1);
+		double ts = u * 1.0;
+		Screen.DrawText(big, Font.CR_UNTRANSLATED, (sw - big.StringWidth(t) * ts) / 2, sh * 0.32, t, DTA_ScaleX, ts, DTA_ScaleY, ts);
+		String nm = NAMES[sel];
+		double ns = u * 1.5;
+		Screen.DrawText(big, Font.CR_UNTRANSLATED, (sw - big.StringWidth(nm) * ns) / 2, sh * 0.42, nm, DTA_ScaleX, ns, DTA_ScaleY, ns);
+		String hint = "< >  browse     Enter  start";
+		Screen.DrawText(small, Font.CR_UNTRANSLATED, (sw - small.StringWidth(hint) * u) / 2, sh * 0.62, hint, DTA_ScaleX, u, DTA_ScaleY, u);
+	}
+}
+
+class IsaacCharMenu : ListMenu
+{
+	int sel;
+	bool tainted;
+	static const int BASE_IDS[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 15, 16, 18, 19 };
+	static const int TAINT_IDS[] = { 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37 };
+	static const String NAMES[] = { "Isaac", "Magdalene", "Cain", "Judas", "???", "Eve", "Samson", "Azazel", "Lazarus",
+		"Eden", "The Lost", "Lilith", "Keeper", "Apollyon", "The Forgotten", "Bethany", "Jacob & Esau" };
+
+	int currentId() { return tainted ? TAINT_IDS[sel] : BASE_IDS[sel]; }
+
+	override bool MenuEvent(int mkey, bool fromcontroller)
+	{
+		int n = BASE_IDS.Size();
+		if (mkey == MKEY_Left) { sel = (sel + n - 1) % n; MenuSound("menu/cursor"); return true; }
+		if (mkey == MKEY_Right) { sel = (sel + 1) % n; MenuSound("menu/cursor"); return true; }
+		if (mkey == MKEY_Up || mkey == MKEY_Down) { tainted = !tainted; MenuSound("menu/cursor"); return true; }
+		if (mkey == MKEY_Enter)
+		{
+			MenuSound("menu/choose");
+			EventHandler.SendNetworkEvent("isaac_newrun", currentId(), IsaacMainMenu.saveSlot());
+			IsaacMainMenu.closeAllMenus();   // unpause Doom so the event actually reaches the handler
+			return true;
+		}
+		return Super.MenuEvent(mkey, fromcontroller);
+	}
+
+	override void Drawer()
+	{
+		int sw = Screen.GetWidth(), sh = Screen.GetHeight();
+		double u = sh / 270.0;
+		TextureID bg = TexMan.CheckForTexture("IUVSBG", TexMan.Type_Any);
+		if (bg.IsValid()) Screen.DrawTexture(bg, false, 0, 0, DTA_DestWidth, sw, DTA_DestHeight, sh, DTA_Alpha, 0.9);
+		else Screen.Dim(Color(255, 0, 0, 0), 0.85, 0, 0, sw, sh);
+		int id = currentId();
+		Font big = Font.GetFont("ISUPHEAV");
+		if (!big) big = BigFont;
+		Font small = Font.GetFont("ISMEAT12");
+		if (!small) small = SmallFont;
+		// portrait
+		TextureID pt = TexMan.CheckForTexture(String.Format("IUPP%02d", id), TexMan.Type_Any);
+		if (pt.IsValid())
+		{
+			Vector2 sz = TexMan.GetScaledSize(pt);
+			double k = (110 * u) / max(sz.x, sz.y);
+			double bob = sin(MSTime() / 180.0) * 3 * u;
+			Screen.DrawTexture(pt, false, sw / 2 - sz.x * k / 2, sh / 2 - sz.y * k / 2 - 10 * u + bob,
+				DTA_DestWidthF, sz.x * k, DTA_DestHeightF, sz.y * k, DTA_TopLeft, true);
+		}
+		// name plate (the game's own lettering), else text
+		TextureID nm = TexMan.CheckForTexture(String.Format("IUPN%02d", id), TexMan.Type_Any);
+		if (nm.IsValid())
+		{
+			Vector2 sz = TexMan.GetScaledSize(nm);
+			Screen.DrawTexture(nm, false, sw / 2 - sz.x * u * 0.6, sh / 2 + 52 * u, DTA_DestWidthF, sz.x * u * 1.2, DTA_DestHeightF, sz.y * u * 1.2, DTA_TopLeft, true);
+		}
+		else
+		{
+			String t = NAMES[sel];
+			Screen.DrawText(big, Font.CR_UNTRANSLATED, (sw - big.StringWidth(t) * u) / 2, sh / 2 + 60 * u, t, DTA_ScaleX, u, DTA_ScaleY, u);
+		}
+		String mode = tainted ? "TAINTED" : "NORMAL";
+		Screen.DrawText(big, Font.CR_UNTRANSLATED, (sw - big.StringWidth(mode) * u * 0.8) / 2, 24 * u, mode, DTA_ScaleX, u * 0.8, DTA_ScaleY, u * 0.8);
+		double aw = big.StringWidth("<") * u * 1.5;
+		Screen.DrawText(big, Font.CR_UNTRANSLATED, sw / 2 - 90 * u - aw, sh / 2 - 12 * u, "<", DTA_ScaleX, u * 1.5, DTA_ScaleY, u * 1.5);
+		Screen.DrawText(big, Font.CR_UNTRANSLATED, sw / 2 + 90 * u, sh / 2 - 12 * u, ">", DTA_ScaleX, u * 1.5, DTA_ScaleY, u * 1.5);
+		String hint = "Left / Right: character    Up / Down: tainted    Enter: new run    Esc: back";
+		Screen.DrawText(small, Font.CR_UNTRANSLATED, (sw - small.StringWidth(hint) * u * 0.7) / 2, sh - 24 * u, hint, DTA_ScaleX, u * 0.7, DTA_ScaleY, u * 0.7);
+	}
+}

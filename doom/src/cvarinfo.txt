@@ -1,0 +1,57 @@
+// Written by the bridge via `set ...` inside isaac_in.cfg, read by ZScript every tic.
+nosave int    isaac_seq    = 0;
+nosave string isaac_room   = "";
+nosave string isaac_grid   = "";
+nosave string isaac_ents   = "";
+nosave string isaac_player = "";
+nosave string isaac_hud    = "";
+nosave string isaac_gridspr = "";
+nosave string isaac_map    = "";
+nosave string isaac_popup  = "";
+nosave int    isaac_popupseq = 0;
+nosave string isaac_fx     = "";
+nosave int    isaac_fxseq  = 0;
+// Doom -> bridge: log lines are padded to this many bytes so GZDoom's stdio
+// buffer flushes on every line (set to 0 if your build flushes anyway).
+nosave int    isaac_logpad = 4200;
+// size of Isaac sprites in Doom (tune live: "isaac_scale 1.2")
+user float isaac_scale = 1.6;
+// size of rocks / poop / props (grid art)
+user float isaac_gridscale = 1.3;
+nosave string isaac_hearts = "";
+// 1 = Isaac's own HUD art (needs isaacui.pk3), 0 = plain text HUD
+user bool isaac_isaachud = true;
+nosave string isaac_intro = "";
+nosave int isaac_curse = 0;
+nosave string isaac_sfx = "";
+nosave int isaac_sfxseq = 0;
+nosave int isaac_fall = 0;
+nosave int isaac_music = 0;
+nosave int isaac_unicorn = 0;   // unicorn invincibility: rainbow tint + sped-up music
+
+// shot readability: height of enemy shots above the floor (eye level is 41),
+// floor shadows under shots/tears, fading trails behind enemy shots
+user float isaac_shotz = 28;
+user bool isaac_shadows = true;
+user bool isaac_trails = true;
+
+// HUD safe area: fraction of the screen to pull the HUD in from every edge (VR: ~0.12)
+user float isaac_hudinset = 0.0;
+
+nosave string isaac_beams = "";   // laser beams: "id:variant:scale:x,y,x,y,...|..."
+nosave bool isaac_beams_on = true;   // draw laser beams (set false to rule them out when hunting a crash; resets on launch)
+user int isaac_saveslot = 1;      // Isaac save file (1-3) used when starting / continuing a run from Doom's menu
+nosave int isaac_beamstyle = 0;   // 0 = Isaac art flat on the floor, 2 = upright billboards (visibility test)
+user bool isaac_maprotate = true;  // small minimap turns with you (heading up, like a sat-nav)
+nosave string isaac_stats = "";   // found-HUD stats from Isaac: speed,tears,damage,range,shotspeed,luck,devil%,angel%,planetarium%
+user bool isaac_stathud = true;   // show Isaac's stats down the left of the screen
+user string isaac_seed = "";      // seed for new runs started from Doom's menu (8 letters/digits, blank = random)
+// how much of the room's shadow overlay falls on the sprites (0 = none, 1 = as dark as the floor);
+// tune live: "isaac_shadow 0.3"
+user float isaac_shadow = 0.45;
+// how much darker the ceiling is than the room (light levels); tune live: "isaac_ceillight 80"
+user int isaac_ceillight = 70;
+nosave int isaac_frozen = 0;     // 1 while Isaac shows its stage card / fades in (renders, doesn't update)
+nosave int isaac_stageseq = 0;   // bumps on every new floor or run: the cue for the progress card
+// pull the round minimap in from the corner (HUD units, 270 per screen height); the VR cfg sets it
+user float isaac_mapinset = 0;
