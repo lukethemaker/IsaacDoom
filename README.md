@@ -1,11 +1,10 @@
 # IsaacDoom
 
-Play a real run of *The Binding of Isaac: Repentance* in first person, through GZDoom.
+Here's the Binding of Isaac DOOM crossover mod that I've built over a week or so.
 
-> **Status: released as-is, not maintained.** This was built by describing what I wanted
-> to an AI coding assistant and testing it in-game; it plays whole runs, but nobody has
-> read every line and I'm not continuing it. It's MIT-licensed — fork it, fix it, take it
-> wherever you like. `HANDOFF.md` explains how the pieces fit together and what's rough.
+I have no plans to continue development on this so consider it the first and final release on my part. Have at it, everybody.
+
+I am releasing it as is. It was coded with significant AI assistance and I cannot personally speak for the quality of the code. 
 
 Isaac runs the actual game in the background (every item, enemy, boss and floor behaves
 exactly as it does in Isaac, because it *is* Isaac). A small Lua mod streams the room to a
@@ -118,7 +117,5 @@ console settings; `isaac_hudinset` pulls the HUD in from the edges.
 
 ## Legal
 
-IsaacDoom's code is MIT-licensed (see `LICENSE`). It contains no assets from The Binding
-of Isaac or from Doom II, and it must not be redistributed with any. Everything it draws
-is built at setup time from the copy of Isaac you own and stays on your computer. The
-Binding of Isaac is © Nicalis / Edmund McMillen; Doom is © id Software.
+This contains no assets from The Binding of Isaac or from Doom II, and it must not be redistributed with any. Everything it draws
+is built at setup time from the copy of Isaac you own and stays on your computer. The Binding of Isaac is © Nicalis / Edmund McMillen; Doom is © id Software.
